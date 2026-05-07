@@ -5,7 +5,7 @@
 \section{问题描述与设计动机}
 在 VL-MoE 推理系统中，MoE 层的专家访问由 Router 动态决定。对于显存受限的部署场景，专家权重往往无法全部常驻 GPU，而需要在 CPU 与 GPU 之间按需搬运。若系统等到真实访问发生时才开始加载专家，就会在专家计算路径上引入明显等待时间，从而放大 TTFT 和解码阶段时延。
 
-围绕这一问题，本文将其定义为面向 offload 场景的\textbf{专家提前调度问题}：利用当前层 Router 已经产生的路由信号，预测未来若干层更可能激活的专家集合，并在真实访问发生前完成预取、驻留和替换决策，从而把一部分等待时间前移到当前层的计算窗口中。现有系统工作已经从 KV cache、prefill/decoding 解耦以及 expert offloading 等角度探索过 serving 优化，代表性方法包括 PagedAttention、DistServe、MoE-Infinity 和 ExpertFlow\cite{kwon2023pagedattention,zhong2024distserve,xue2024moeinfinity,he2024expertflow}。本文进一步利用\textbf{路由可预测性}，把优化对象从“被动处理专家访问”推进到“主动规划专家访问”。
+围绕这一问题，本文将其定义为面向 offload 场景的\textbf{专家提前调度问题}：利用当前层 Router 已经产生的路由信号，预测未来若干层更可能激活的专家集合，并在真实访问发生前完成预取、驻留和替换决策，从而把一部分等待时间前移到当前层的计算窗口中。现有系统工作已经从 KV cache、prefill/decoding 解耦以及 expert offloading 等角度探索过 serving 优化\cite{kwon2023pagedattention,zhong2024distserve,xue2024moeinfinity,he2024expertflow,zhu2026dali}。本文进一步利用\textbf{路由可预测性}，把优化对象从“被动处理专家访问”推进到“主动规划专家访问”。
 
 与纯文本 MoE 相比，Qwen3-VL 这类多模态模型还具有额外的条件变量。图像 Token 与文本 Token 的路由密度、位置分布和上下文稳定性并不相同，因此本文在预测器输入和调度器决策中都显式引入模态信息，而不是把它当成后处理噪声。
 
@@ -68,7 +68,7 @@
 其中 $\rho(\cdot)$ 表示由 router 概率与 Top-$k$ one-hot 计算得到的统计特征映射。
 
 \subsection{网络结构}
-预测器采用“共享骨干 + 多层输出头”的轻量结构。首先将路由信号和 token 信号投影到同一隐空间，再经过多层 MLP backbone 提取稳定特征，最后为每一层设置独立输出头，直接输出该层的专家 logits。对应到实现，核心模块位于 \texttt{expertflow\_offload/expertflow\_offload/qwen3vl\_global.py}。其中 \texttt{route\_proj} 负责处理 router 概率和 Top-$k$ one-hot，\texttt{token\_proj} 负责处理 token 位置，\texttt{use\_extra\_features} 打开后再接入 input id、模态和 route statistics。
+预测器采用“共享骨干 + 多层输出头”的轻量结构。首先将路由信号和 token 信号投影到同一隐空间，再经过多层 MLP backbone 提取稳定特征，最后为每一层设置独立输出头，直接输出该层的专家 logits。对应到实现，核心模块位于原型系统的 \texttt{qwen3vl\_global.py}。其中 \texttt{route\_proj} 负责处理 router 概率和 Top-$k$ one-hot，\texttt{token\_proj} 负责处理 token 位置，\texttt{use\_extra\_features} 打开后再接入 input id、模态和 route statistics。
 
 \begin{figure}[!htbp]
 \centering
@@ -107,14 +107,14 @@ s(e,h) = \alpha_h \cdot p(e,h) \cdot \max(p_1-p_2,0),
 
 这一设计的核心思想是：不是“看见预测就搬运”，而是“只有高置信、近未来、收益大于成本的专家才进入缓存”。因此，预算、置信度阈值、最小 margin 和每层 key 上限共同决定最终的预取行为。
 
-\subsection{ExpertFlow、DALI 与 Hybrid}
-本文在同一套预测器上实现了三类调度方式。
+\subsection{融合式缓存调度策略}
+在上述加权预取策略基础上，本文最终采用一种\textbf{融合式缓存调度策略}，将“候选专家评分”和“预测工作集重排”结合起来使用，而不是简单地扩大预取集合。
 
-\textbf{ExpertFlow 风格}策略强调按预测权重做稀疏预取，即根据全局预测分数直接挑选少量专家进入 GPU cache；它更适合在预测质量较高、预算较紧的情况下使用。
+具体而言，调度器首先根据全局预测结果形成未来若干层的候选专家集合，并对候选专家进行置信度过滤、层距衰减和 margin 过滤；随后，系统根据预测工作集更新缓存内部的驻留优先级，使更可能被后续层访问的专家获得更高保留分数，而与未来工作集关系较弱的缓存项则逐步降权。
 
-\textbf{DALI 风格}策略强调 working-set 重排，即允许缓存围绕预测工作集重新整理，而不是只做增量式 prefetch；它更适合希望缓存结构与未来工作集更贴近的场景。
+在执行预取时，调度器只从筛选后的高价值候选集中选择有限数量的专家，并保护当前层正在计算的真实专家，避免预取操作把当前工作集挤出 GPU cache。这样，缓存既能提前吸收未来高概率专家，又能避免低置信度预测造成无效搬运。
 
-\textbf{Hybrid} 则先利用 DALI 风格更新缓存内部的工作集状态，再用 ExpertFlow 风格的加权预取补充候选 key。换句话说，Hybrid 不是把两种方法简单相加，而是同时保留工作集视角和稀疏控制能力。
+该策略可以概括为“先重排、再预取、保当前、限预算”：先根据预测工作集调整缓存分数，再按加权分数执行有限预取，同时保护当前层真实访问专家，并通过每层 key 上限和全局预算限制额外传输量。相比单纯按分数预取，该策略能减少缓存污染；相比只做工作集重排，它又能主动把高概率专家提前搬入 GPU。
 
 \subsection{预测错误与回退机制}
 预测驱动的调度不可避免会出现误预测，因此系统需要在正确性与收益之间做折中。本文采用两级回退机制：
@@ -140,4 +140,4 @@ s(e,h) = \alpha_h \cdot p(e,h) \cdot \max(p_1-p_2,0),
 而缓存更新和排序通常可压缩到候选集合规模上的 $O(K\log K)$。
 
 \section{本章小结}
-本章从 fresh 路由数据出发，构建了一个 layer-0 条件化的全局预测器，并在此基础上设计了 ExpertFlow、DALI 和 Hybrid 三类专家调度策略。与纯静态缓存不同，本文方法把预测信号直接引入专家预取、缓存重排和回退机制中，使得专家搬运从“访问后处理”变成“访问前准备”。下一章将围绕真实 CPU-GPU expert offload 微基准对该方法进行实验验证。
+本章从 fresh 路由数据出发，构建了一个 layer-0 条件化的全局预测器，并在此基础上设计了融合式缓存调度策略。与纯静态缓存不同，本文方法把预测信号直接引入专家预取、缓存重排和回退机制中，使得专家搬运从“访问后处理”变成“访问前准备”。下一章将围绕真实 CPU-GPU expert offload 微基准对该方法进行实验验证。

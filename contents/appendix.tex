@@ -363,7 +363,7 @@ def select_weighted_global_prefetch_plan(
     return [(key, float(score)) for key, score in ranked[: int(budget)]]
 
 
-def select_dali_working_set_plan(...):
+def select_working_set_rebalance_plan(...):
     return select_weighted_global_prefetch_plan(
         ...,
         exclude_resident=False,
@@ -371,7 +371,7 @@ def select_dali_working_set_plan(...):
 \end{CodeBlock}
 
 \section{真实 offload 调度入口}
-真实 CPU-GPU expert offload 微基准中，系统按 trace group 顺序执行。对于 \texttt{demand} 策略，访问专家时同步加载；对于 \texttt{global} 策略，在第 0 层得到全局预测结果，然后按 ExpertFlow、DALI 或 Hybrid 策略触发预取和缓存重排；对于 \texttt{oracle} 策略，则使用未来真实路由作为上界。
+真实 CPU-GPU expert offload 微基准中，系统按 trace group 顺序执行。对于 \texttt{demand} 策略，访问专家时同步加载；对于 \texttt{global} 策略，在第 0 层得到全局预测结果，然后按评分预取、工作集重排或融合式调度配置触发预取和缓存重排；对于 \texttt{oracle} 策略，则使用未来真实路由作为上界。
 \begin{CodeBlock}
 for group in groups:
     if policy == "global":
@@ -384,8 +384,8 @@ for group in groups:
             )
             global_state_by_batch[group.batch_id] = predictions
 
-        if args.global_scheduler_mode in {"dali", "hybrid"}:
-            dali_plan = select_dali_working_set_plan(
+        if args.global_scheduler_mode in {"rebalance", "fused"}:
+            working_set_plan = select_working_set_rebalance_plan(
                 layer_id=group.layer_id,
                 token_positions=[(0, t) for t in group.token_indices],
                 predictions=global_state_by_batch.get(group.batch_id, {}),
@@ -399,11 +399,11 @@ for group in groups:
                 max_keys_per_layer=args.global_max_keys_per_layer,
             )
 
-            if args.global_scheduler_mode == "hybrid":
+            if args.global_scheduler_mode == "fused":
                 protected = current_active_keys(group)
-                cache.score_update(dict(dali_plan))
+                cache.score_update(dict(working_set_plan))
                 cache.demote_outside_working_set(
-                    {key for key, _score in dali_plan},
+                    {key for key, _score in working_set_plan},
                     protected=protected,
                     factor=0.9,
                 )
@@ -423,7 +423,7 @@ for group in groups:
                 cache.prefetch_scored(scored_plan, protected=protected, allow_evict=True)
             else:
                 cache.rebalance_working_set(
-                    dali_plan,
+                    working_set_plan,
                     protected=current_active_keys(group),
                     allow_evict=True,
                 )
