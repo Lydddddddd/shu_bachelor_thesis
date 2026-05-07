@@ -1,0 +1,89 @@
+% !Mode:: "TeX:UTF-8"
+\chapter{绪论}
+\label{cha:intro}
+
+\section{VL-MoE 推理优化的研究背景和意义}
+近年来，多模态大模型（Multimodal Large Models, MLLMs）快速发展，图像、文本、语音等多种模态的统一建模逐渐成为大模型研究的重要方向。
+以 Qwen-VL、Qwen2-VL、MiniCPM-V 和 DeepSeek-VL2 为代表的开源多模态模型在视觉问答、文档理解、图文检索和复杂推理等任务上展现出较强能力\cite{bai2023qwenvl,wang2024qwen2vl,yao2024minicpmv,wu2024deepseekvl2}。
+随着模型规模和输入复杂度不断提升，多模态推理系统已经从“能否部署”逐步转向“如何高效部署”的阶段。相比纯文本大模型，多模态模型在推理时不仅要处理文本序列，还需要完成视觉特征提取、跨模态对齐以及自回归生成等多个环节，因此其时延、吞吐和显存开销问题更加突出。
+
+混合专家模型（Mixture of Experts, MoE）通过稀疏激活机制在保持总参数规模较大的同时降低单个 Token 的有效计算量，已成为提升模型参数效率的重要技术路线。
+将 MoE 结构引入视觉语言模型后，形成了 VL-MoE（Vision-Language Mixture-of-Experts）这一具有代表性的多模态稀疏架构\cite{lin2024moellava}。
+如图~\ref{fig:vlmoe-architecture} 所示，VL-MoE 的典型推理流程包括视觉编码、模态融合、路由决策、专家计算与文本解码等阶段。
+在这一过程中，视觉侧和专家侧共同决定了系统性能上限：一方面，图像通常会被划分为大量视觉 Token，导致 Visual Encoder 前端计算负担较重；另一方面，MoE Router 需要为不同 Token 动态选择专家，进而带来权重访问、缓存命中、通信调度以及负载均衡等一系列系统问题。
+
+\begin{figure}[!htbp]
+\centering
+\includegraphics[width=0.95\textwidth]{vlmoe_architecture.png}
+\caption{VL-MoE 模型的一般推理链路与专家路由示意图}
+\label{fig:vlmoe-architecture}
+\end{figure}
+
+从系统角度看，VL-MoE 推理优化至少面临以下三方面挑战。第一，视觉输入通常远长于文本输入，多模态请求在前端阶段会产生显著高于文本侧的计算与显存开销，导致首字延迟（Time To First Token, TTFT）偏高。第二，图像 Token 与文本 Token 在语义结构、时序特性和路由分布上存在明显差异，如果仍然套用面向纯文本 MoE 的统一调度策略，将难以充分发挥多模态稀疏模型的潜力。第三，MoE 推理过程中的专家激活具有动态性，若专家权重不能及时预取或缓存，将造成频繁的数据搬移和调度等待，尤其在资源受限或涉及 CPU-GPU offload 的场景下更为明显。
+
+基于上述背景，围绕 VL-MoE 的推理负载均衡与加速开展研究，具有明确的理论意义和工程价值。在理论层面，通过对视觉 Token、文本 Token 以及专家路由行为进行系统化分析，可以揭示多模态稀疏模型的负载特征和跨层可预测性规律，为后续优化方法提供依据。在工程层面，通过分别从 Visual Encoder 和 MoE 调度两个关键环节入手，有望在保证模型效果稳定的前提下有效降低 TTFT、提升系统吞吐并缓解显存压力，进而提高多模态大模型在在线服务和资源受限部署场景中的实用性。
+
+本文的研究思路并不是将优化工作割裂为多个局部技巧，而是围绕完整推理链路开展协同设计：首先通过 profiling 分析识别负载瓶颈，再针对视觉侧高耗时问题设计多模态感知的 Encoder 优化方法，最后结合专家激活的跨层相关性构建基于可预测性的提前调度机制。本文的总体技术路线如图~\ref{fig:technical-roadmap} 所示。
+
+\begin{figure}[!htbp]
+\centering
+\setlength{\fboxsep}{7pt}
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{c}
+\fbox{\parbox{0.82\textwidth}{\centering\textbf{负载特征分析与问题建模}\\
+围绕多模态输入负载、Visual Encoder 开销、专家分布均衡性与跨层路由相关性展开 profiling，定位系统瓶颈并明确优化目标。}}\\[6pt]
+$\Downarrow$\\[6pt]
+\fbox{\parbox{0.82\textwidth}{\centering\textbf{面向 Visual Encoder 的多模态感知优化}\\
+通过视觉 Token 压缩与异步流水执行，降低视觉前端计算开销并减少首字延迟。}}\\[6pt]
+$\Downarrow$\\[6pt]
+\fbox{\parbox{0.82\textwidth}{\centering\textbf{基于可预测性的专家提前调度}\\
+利用跨层专家激活相关性构建轻量级预测器，结合预取、缓存与差异化调度策略降低专家访问与通信开销。}}\\[6pt]
+$\Downarrow$\\[6pt]
+\fbox{\parbox{0.82\textwidth}{\centering\textbf{系统实现与综合评估}\\
+在公开数据集与典型部署场景中，从时延、吞吐、显存、缓存命中率和精度保持等维度评估优化效果。}}
+\end{tabular}
+\caption{本文的总体技术路线}
+\label{fig:technical-roadmap}
+\end{figure}
+
+\section{VL-MoE 推理优化国内外研究概况}
+围绕 VL-MoE 推理优化的相关研究，现阶段主要可以归纳为三条技术脉络：其一是多模态模型结构设计，重点关注如何在视觉与语言之间建立统一表示并提升模型能力；其二是视觉侧 Token 压缩与 Encoder 加速，重点解决多模态输入带来的前端高计算开销问题；其三是 MoE 推理系统优化与专家调度，重点关注专家访问、缓存、卸载以及跨设备调度效率。
+总体来看，国内研究在多模态模型开源和工程落地方面进展迅速，国外研究则在通用推理系统、视觉 Token 精简和 MoE 专项优化方面形成了较为系统的方法体系。
+
+\subsection{国内 VL-MoE 相关研究概况}
+国内在多模态大模型方向起步较早，并逐步形成了从模型能力构建到部署实践的完整研究链条。
+阿里巴巴提出的 Qwen-VL 通过统一视觉语言建模框架兼顾图文理解、定位与 OCR 等任务能力\cite{bai2023qwenvl}；
+Qwen2-VL 进一步提升了模型对动态分辨率、多尺度输入和复杂视觉场景的感知能力\cite{wang2024qwen2vl}。
+面向轻量化部署需求，MiniCPM-V 通过压缩与蒸馏等策略实现了终端侧多模态推理\cite{yao2024minicpmv}。
+这些工作推动了多模态模型从能力展示走向实际应用，为后续推理优化研究提供了良好的模型基础。
+
+在稀疏化多模态模型方面，DeepSeek-VL2 将 MoE 机制系统性地引入视觉语言建模，说明 MoE 已逐渐成为多模态模型的重要结构选择\cite{wu2024deepseekvl2}。
+国内相关研究整体上更强调模型能力、数据构建以及部署可用性，而对推理阶段的细粒度系统剖析和底层调度优化关注相对不足。
+尤其是在 Visual Encoder 与 MoE Backbone 的协同优化、多模态 Token 路由差异建模、以及基于跨层可预测性的专家提前调度等方面，仍缺少针对 VL-MoE 特性的系统化方案。
+因此，围绕 VL-MoE 推理过程开展面向负载均衡与系统加速的研究，具有明显的必要性和提升空间。
+
+\subsection{国外 VL-MoE 相关研究概况}
+国外研究在视觉侧优化方面展开较早。Token Merging（ToMe）通过特征相似性对 Vision Transformer 中的 Token 进行动态合并，在尽量保持模型精度的前提下显著降低视觉编码计算量\cite{bolya2023tome}。
+PuMer 则进一步将视觉与文本语义信息结合起来，对视觉语言模型中的 Token 同时进行裁剪和合并，验证了语义感知压缩对多模态推理加速的有效性\cite{cao2023pumer}。
+这类工作表明，视觉侧冗余是多模态推理优化的重要突破口。
+
+在通用推理系统方面，vLLM 通过 PagedAttention 机制显著改善了 KV Cache 的内存管理效率，为大模型推理提供了高吞吐基础设施\cite{kwon2023pagedattention}。
+DistServe 从服务系统角度将 Prefill 与 Decoding 解耦部署，以提升在线场景中的整体 goodput\cite{zhong2024distserve}。
+上述研究对大模型推理系统具有重要意义，但其优化重点主要面向稠密模型或通用服务流程，对于 VL-MoE 特有的视觉编码链路、多模态负载差异以及专家路由异质性考虑不足。
+
+在 MoE 推理专项优化方面，MoE-LLaVA 首次较系统地将 MoE 结构应用于大型视觉语言模型，为后续 VL-MoE 研究提供了代表性架构范式\cite{lin2024moellava}。
+MoE-Infinity 从激活感知卸载角度降低了专家权重搬移开销\cite{xue2024moeinfinity}，Klotski 利用专家感知的多 Batch 流水机制提升了 MoE 推理效率\cite{fang2025klotski}。
+进一步地，ExpertFlow 将预测式路由路径、专家缓存与动态 Token 调度结合起来，展示了“基于可预测性进行提前调度”的潜力\cite{he2024expertflow}。
+然而，现有研究大多仍然面向纯文本 MoE 或通用稀疏模型展开，对 VL-MoE 场景下图像 Token 与文本 Token 的异质性利用不足，也较少从“视觉侧高开销 + 专家侧高动态性”两个问题共同出发进行端到端联合优化。
+
+\section{本文的主要工作和章节安排}
+针对 VL-MoE 推理过程中的高首字延迟、负载不均衡以及专家访问开销问题，本文围绕“特征分析、方法设计、系统实现与实验验证”四个层面展开研究，主要工作包括以下四个方面。
+
+\begin{enumerate}
+\item 基于 vLLM、Nsight Systems 和 PyTorch Profiler，对典型 VL-MoE 模型的推理过程进行全链路 profiling，量化 Visual Encoder、模态融合、MoE Backbone 与专家通信的开销占比，并从输入负载、专家分布均衡性和跨层路由相关性三个方面分析系统瓶颈。
+\item 面向 Visual Encoder 的高耗时问题，设计多模态感知的视觉 Token 压缩与异步流水优化方法，以减少冗余视觉计算并增强视觉侧与文本侧的执行重叠程度，从而降低 TTFT 和前端显存压力。
+\item 针对 MoE 路由动态性带来的调度困难，利用跨层专家激活之间的相关性构建轻量级专家预测模型，并进一步设计面向多模态场景的专家预取、缓存管理与差异化调度策略，以降低专家访问和通信等待开销。
+\item 在原型系统中集成上述优化策略，并在公开多模态数据集上从 TTFT、吞吐量、显存占用、专家缓存命中率以及任务精度保持情况等角度进行综合评估，验证方法的有效性与适用场景。
+\end{enumerate}
+
+全文共分为五章，具体安排如下：第一章为绪论，介绍课题研究背景、研究意义、国内外研究现状以及本文的主要工作；第二章对 VL-MoE 推理链路进行负载特征分析与问题建模，明确系统瓶颈和优化目标；第三章研究面向 Visual Encoder 的多模态感知优化方法，重点讨论视觉 Token 压缩与异步流水设计；第四章研究基于可预测性的专家提前调度方法，给出专家预测、预取、缓存与多模态差异化调度机制；第五章介绍系统实现与实验评估，展示各项优化策略在不同场景下的性能收益与精度影响。最后在结论部分对全文工作进行总结，并讨论后续研究方向。

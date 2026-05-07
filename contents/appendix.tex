@@ -1,0 +1,530 @@
+\chapter{关键实现代码}
+
+本附录节选第三章与第四章中最能体现方法逻辑的关键实现片段。第三章部分主要包括 SAT-ToMe 语义引导保留模块、视觉编码器阶段拆分，以及与主模型的双流 overlap 集成逻辑；第四章部分主要包括 layer-0 条件化全局路由预测器、多标签训练与 Recall 评估、预测式专家预取策略，以及真实 CPU-GPU expert offload 调度入口。为便于阅读，以下代码省略了与测试、日志、命令行参数和模板兼容性无关的次要细节。
+
+\DefineVerbatimEnvironment{CodeBlock}{Verbatim}{
+    fontsize=\scriptsize,
+    breaklines=true,
+    breakanywhere=true,
+    numbers=left,
+    numbersep=4pt,
+    xleftmargin=2em
+}
+
+\section{SAT-ToMe 语义引导保留模块}
+该模块用于计算视觉 Token 与文本查询的余弦相似度，并根据语义熵动态决定保留数量。
+\begin{CodeBlock}
+class SAT_ToMe_Module(nn.Module):
+    def __init__(self, vis_dim, text_dim, base_ratio=0.5):
+        super().__init__()
+        self.base_ratio = base_ratio
+        self.text_proj = nn.Linear(text_dim, vis_dim)
+        self.text_proj.weight.is_uninitialized = True
+        self.text_proj.bias.is_uninitialized = True
+
+    def forward(self, x_vis, text_feat):
+        if text_feat is None:
+            return x_vis, torch.arange(x_vis.shape[0], device=x_vis.device)
+
+        N, C = x_vis.shape
+        q_text = self.text_proj(text_feat.to(x_vis.dtype))
+
+        norm_vis = F.normalize(x_vis, p=2, dim=-1)
+        norm_text = F.normalize(q_text, p=2, dim=-1)
+        scores = torch.matmul(norm_vis, norm_text.T).squeeze(-1)
+        scores_p = F.softmax(scores, dim=-1)
+
+        entropy = -torch.sum(scores_p * torch.log(scores_p + 1e-6))
+        max_entropy = torch.log(torch.tensor(float(N), device=x_vis.device))
+        adaptive_ratio = self.base_ratio * (1 - entropy / max_entropy)
+
+        k = max(16, int(N * (1 - adaptive_ratio.item())))
+        _, topk_indices = torch.topk(scores, k)
+        topk_indices, _ = torch.sort(topk_indices)
+
+        return x_vis[topk_indices], topk_indices
+\end{CodeBlock}
+
+\section{视觉编码器阶段拆分}
+该部分将原始视觉前向过程拆分为预处理、Stage 1、语义压缩和 Stage 2 四个阶段，便于在主流与视觉流之间插入同步点。
+\begin{CodeBlock}
+def _prepare_vision_inputs(self, x: torch.Tensor, grid_thw: torch.Tensor | list[list[int]]):
+    hidden_states = x.to(device=self.device, dtype=self.dtype, non_blocking=True)
+    hidden_states = self.patch_embed(hidden_states)
+
+    if isinstance(grid_thw, list):
+        grid_thw_list = grid_thw
+        grid_thw = np.array(grid_thw, dtype=np.int32)
+    else:
+        grid_thw_list = grid_thw.tolist()
+        grid_thw = grid_thw.numpy()
+
+    pos_embeds = self.fast_pos_embed_interpolate(grid_thw_list)
+    hidden_states = hidden_states + pos_embeds
+    rotary_pos_emb_cos, rotary_pos_emb_sin = self.rot_pos_emb(grid_thw_list)
+
+    cu_seqlens = np.repeat(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
+        axis=0, dtype=np.int32
+    )
+    cu_seqlens = np.concatenate([np.zeros(1, dtype=np.int32), cu_seqlens])
+    cu_seqlens = torch.from_numpy(cu_seqlens)
+
+    hidden_states = hidden_states.unsqueeze(1)
+    max_seqlen = self.compute_attn_mask_seqlen(cu_seqlens)
+    cu_seqlens = cu_seqlens.to(self.device, non_blocking=True)
+
+    return hidden_states, cu_seqlens, rotary_pos_emb_cos, rotary_pos_emb_sin, max_seqlen
+
+
+def forward_stage1(self, hidden_states, cu_seqlens, rotary_pos_emb_cos, rotary_pos_emb_sin, max_seqlen):
+    for layer_num in range(12):
+        blk = self.blocks[layer_num]
+        hidden_states = blk(
+            hidden_states,
+            cu_seqlens=cu_seqlens,
+            rotary_pos_emb_cos=rotary_pos_emb_cos,
+            rotary_pos_emb_sin=rotary_pos_emb_sin,
+            max_seqlen=max_seqlen,
+        )
+    return hidden_states
+
+
+def excute_semantic_merge(self, hidden_states, text_feat, rotary_pos_emb_cos, rotary_pos_emb_sin):
+    vis_feat = hidden_states.squeeze(1) if hidden_states.dim() == 3 else hidden_states
+    merged_feat, keep_indices = self.sat_tome(vis_feat, text_feat)
+
+    hidden_states = merged_feat.unsqueeze(1) if hidden_states.dim() == 3 else merged_feat
+    new_cos = rotary_pos_emb_cos[keep_indices]
+    new_sin = rotary_pos_emb_sin[keep_indices]
+
+    new_N = merged_feat.size(0)
+    new_cu_seqlens = torch.tensor([0, new_N], device=hidden_states.device, dtype=torch.int32)
+    new_max_seqlen = torch.tensor(new_N, device=hidden_states.device)
+
+    return hidden_states, new_cu_seqlens, new_cos, new_sin, new_max_seqlen
+
+
+def forward_stage2(self, hidden_states, cu_seqlens, rotary_pos_emb_cos, rotary_pos_emb_sin, max_seqlen):
+    deepstack_feature_lists = []
+    for layer_num in range(12, len(self.blocks)):
+        blk = self.blocks[layer_num]
+        hidden_states = blk(
+            hidden_states,
+            cu_seqlens=cu_seqlens,
+            rotary_pos_emb_cos=rotary_pos_emb_cos,
+            rotary_pos_emb_sin=rotary_pos_emb_sin,
+            max_seqlen=max_seqlen,
+        )
+
+        if layer_num in self.deepstack_visual_indexes:
+            deepstack_merger_idx = self.deepstack_visual_indexes.index(layer_num)
+            deepstack_feature = self.deepstack_merger_list[deepstack_merger_idx](hidden_states)
+            deepstack_feature_lists.append(deepstack_feature)
+
+    hidden_states = self.merger(hidden_states)
+    hidden_states = torch.cat([hidden_states] + deepstack_feature_lists, dim=1)
+	    return hidden_states
+	\end{CodeBlock}
+
+\section{全局路由预测器结构}
+第四章的全局预测器使用第 0 层 Router 概率、Top-$k$ 专家 one-hot、token 位置以及可选的 input id、模态和路由统计特征，一次性预测后续所有 MoE 层的专家激活概率。
+\begin{CodeBlock}
+class GlobalRoutePredictor(torch.nn.Module):
+    def __init__(
+        self,
+        num_experts=128,
+        num_layers=48,
+        hidden_dim=768,
+        token_dim=32,
+        dropout=0.1,
+        use_extra_features=True,
+        input_vocab_size=65536,
+        input_id_dim=64,
+        modality_dim=16,
+        position_bucket_size=4096,
+        position_dim=32,
+        route_stat_dim=16,
+    ):
+        super().__init__()
+        self.num_experts = num_experts
+        self.num_layers = num_layers
+        self.use_extra_features = use_extra_features
+        self.input_vocab_size = input_vocab_size
+        self.position_bucket_size = position_bucket_size
+
+        self.route_proj = torch.nn.Sequential(
+            torch.nn.Linear(num_experts * 2, hidden_dim),
+            torch.nn.LayerNorm(hidden_dim),
+            torch.nn.GELU(),
+            torch.nn.Dropout(dropout),
+        )
+        self.token_proj = torch.nn.Sequential(
+            torch.nn.Linear(1, token_dim),
+            torch.nn.GELU(),
+        )
+
+        feature_dim = hidden_dim + token_dim
+        if self.use_extra_features:
+            self.input_id_embedding = torch.nn.Embedding(input_vocab_size, input_id_dim)
+            self.modality_embedding = torch.nn.Embedding(2, modality_dim)
+            self.position_embedding = torch.nn.Embedding(position_bucket_size, position_dim)
+            self.route_stat_proj = torch.nn.Sequential(
+                torch.nn.Linear(3, route_stat_dim),
+                torch.nn.GELU(),
+            )
+            feature_dim += input_id_dim + modality_dim + position_dim + route_stat_dim
+
+        self.backbone = torch.nn.Sequential(
+            torch.nn.Linear(feature_dim, hidden_dim),
+            torch.nn.GELU(),
+            torch.nn.Dropout(dropout),
+            torch.nn.Linear(hidden_dim, hidden_dim),
+            torch.nn.GELU(),
+            torch.nn.Dropout(dropout),
+            torch.nn.Linear(hidden_dim, hidden_dim),
+            torch.nn.GELU(),
+        )
+        self.heads = torch.nn.ModuleList(
+            [torch.nn.Linear(hidden_dim, num_experts) for _ in range(num_layers)]
+        )
+
+    def forward(self, layer0_probs, layer0_hot, token_idx, input_ids=None, is_visual=None):
+        route_x = self.route_proj(torch.cat([layer0_probs, layer0_hot], dim=1))
+        token_f = (token_idx.float().unsqueeze(1) / 2048.0).clamp(0.0, 1.0)
+        features = [route_x, self.token_proj(token_f).to(dtype=route_x.dtype)]
+
+        if self.use_extra_features:
+            input_emb = self.input_id_embedding(self._hash_input_ids(token_idx, input_ids))
+            modality_emb = self.modality_embedding(self._modality_ids(token_idx, is_visual))
+            position_emb = self.position_embedding(
+                token_idx.clamp(min=0, max=self.position_bucket_size - 1)
+            )
+            route_stats = self.route_stat_proj(self._route_stats(layer0_probs, layer0_hot))
+            features.extend([
+                input_emb.to(dtype=route_x.dtype),
+                modality_emb.to(dtype=route_x.dtype),
+                position_emb.to(dtype=route_x.dtype),
+                route_stats.to(dtype=route_x.dtype),
+            ])
+
+        hidden = self.backbone(torch.cat(features, dim=1))
+        logits = torch.stack([head(hidden) for head in self.heads], dim=1)
+        return logits  # [batch, num_layers, num_experts]
+
+    def _route_stats(self, layer0_probs, layer0_hot):
+        probs = layer0_probs.float()
+        hot = layer0_hot.float()
+        max_prob = probs.max(dim=1).values
+        topk_mass = (probs * hot).sum(dim=1)
+        entropy = -(probs * (probs + 1e-8).log()).sum(dim=1) / math.log(self.num_experts)
+        return torch.stack([topk_mass, max_prob, entropy], dim=1)
+\end{CodeBlock}
+
+\section{全局预测器训练与 Recall 评估}
+训练阶段将每个 token 在各层的真实 Top-$k$ 专家表示为多标签向量，使用 BCEWithLogitsLoss 进行监督；验证阶段统计预测 Top-$k$ 专家与真实激活专家的重合比例，并分别汇总 early、mid、late 三个层段的 Recall。
+\begin{CodeBlock}
+def evaluate(model, loader, device, num_layers, topk, eval_start_layer):
+    model.eval()
+    hits = torch.zeros(num_layers, dtype=torch.float64, device=device)
+    totals = torch.zeros(num_layers, dtype=torch.float64, device=device)
+
+    for token_idx, input_ids, is_visual, layer0_probs, layer0_hot, labels in loader:
+        token_idx = token_idx.to(device, non_blocking=True)
+        input_ids = input_ids.to(device, non_blocking=True)
+        is_visual = is_visual.to(device, non_blocking=True)
+        layer0_probs = layer0_probs.to(device, non_blocking=True)
+        layer0_hot = layer0_hot.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+
+        logits = model(
+            layer0_probs,
+            layer0_hot,
+            token_idx,
+            input_ids=input_ids,
+            is_visual=is_visual,
+        )
+        pred_idx = torch.topk(logits, k=topk, dim=2).indices
+        hits += torch.gather(labels, 2, pred_idx).sum(dim=(0, 2)).double()
+        totals += labels.sum(dim=(0, 2)).double()
+
+    recall_t = torch.where(totals > 0, hits / totals, torch.zeros_like(hits))
+    recall_by_layer = [float(x) for x in recall_t.detach().cpu().tolist()]
+    selected = recall_by_layer[eval_start_layer:]
+    mean_recall = sum(selected) / len(selected)
+    return {
+        "mean_recall": mean_recall,
+        "early_recall": mean(recall_by_layer[max(eval_start_layer, 1):16]),
+        "mid_recall": mean(recall_by_layer[max(eval_start_layer, 16):32]),
+        "late_recall": mean(recall_by_layer[max(eval_start_layer, 32):num_layers]),
+    }
+
+
+def train_one_epoch(model, loader, optimizer, scaler, criterion, args, device):
+    model.train()
+    for token_idx, input_ids, is_visual, layer0_probs, layer0_hot, labels in loader:
+        token_idx = token_idx.to(device, non_blocking=True)
+        input_ids = input_ids.to(device, non_blocking=True)
+        is_visual = is_visual.to(device, non_blocking=True)
+        layer0_probs = layer0_probs.to(device, non_blocking=True)
+        layer0_hot = layer0_hot.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+
+        optimizer.zero_grad(set_to_none=True)
+        with torch.amp.autocast("cuda", enabled=args.amp, dtype=torch.float16):
+            logits = model(
+                layer0_probs,
+                layer0_hot,
+                token_idx,
+                input_ids=input_ids,
+                is_visual=is_visual,
+            )
+            loss = criterion(
+                logits[:, args.loss_start_layer :, :],
+                labels[:, args.loss_start_layer :, :],
+            )
+
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        scaler.step(optimizer)
+        scaler.update()
+\end{CodeBlock}
+
+\section{预测结果到专家预取集合}
+运行时调度器不直接搬运预测器输出的所有专家，而是根据预测置信度、Top-1 与 Top-2 的 margin、层距衰减、当前缓存状态和每层 key 上限，将多 token、多层预测压缩为有限预算下的预取集合。
+\begin{CodeBlock}
+ExpertKey = tuple[int, int]  # (layer_id, expert_id)
+
+
+def select_weighted_global_prefetch_plan(
+    layer_id,
+    token_positions,
+    predictions,
+    lookahead,
+    budget,
+    confidence_threshold=0.02,
+    min_margin=0.0,
+    horizon_decay=0.7,
+    resident_keys=None,
+    protected_keys=None,
+    max_keys_per_layer=0,
+    exclude_resident=True,
+):
+    if budget <= 0 or lookahead <= 0:
+        return []
+
+    demand = defaultdict(float)
+    resident = resident_keys or set()
+    protected = protected_keys or set()
+    num_tokens = len(token_positions)
+
+    for horizon in range(1, lookahead + 1):
+        future_layer = layer_id + horizon
+        rows = predictions.get(future_layer, [])
+        layer_weight = float(horizon_decay ** (horizon - 1))
+
+        for token_idx in range(min(num_tokens, len(rows))):
+            experts = rows[token_idx]
+            if not experts:
+                continue
+
+            top1 = float(experts[0][1])
+            top2 = float(experts[1][1]) if len(experts) > 1 else 0.0
+            margin = top1 - top2
+            if top1 < confidence_threshold:
+                continue
+            if min_margin > 0.0 and margin < min_margin:
+                continue
+
+            token_weight = layer_weight * max(top1, 0.0)
+            if min_margin > 0.0:
+                token_weight *= max(margin, 0.0)
+
+            for expert_id, score in experts:
+                key = (future_layer, int(expert_id))
+                if key in protected:
+                    continue
+                if exclude_resident and key in resident:
+                    continue
+                demand[key] += token_weight * float(score)
+
+    ranked = sorted(demand.items(), key=lambda item: (-item[1], item[0][0], item[0][1]))
+
+    if max_keys_per_layer > 0:
+        per_layer = defaultdict(int)
+        filtered = []
+        for key, score in ranked:
+            if per_layer[key[0]] >= max_keys_per_layer:
+                continue
+            per_layer[key[0]] += 1
+            filtered.append((key, score))
+        ranked = filtered
+
+    return [(key, float(score)) for key, score in ranked[: int(budget)]]
+
+
+def select_dali_working_set_plan(...):
+    return select_weighted_global_prefetch_plan(
+        ...,
+        exclude_resident=False,
+    )
+\end{CodeBlock}
+
+\section{真实 offload 调度入口}
+真实 CPU-GPU expert offload 微基准中，系统按 trace group 顺序执行。对于 \texttt{demand} 策略，访问专家时同步加载；对于 \texttt{global} 策略，在第 0 层得到全局预测结果，然后按 ExpertFlow、DALI 或 Hybrid 策略触发预取和缓存重排；对于 \texttt{oracle} 策略，则使用未来真实路由作为上界。
+\begin{CodeBlock}
+for group in groups:
+    if policy == "global":
+        if group.layer_id == 0:
+            predictions = global_predictor.predict_batch_with_scores(
+                token_indices=group.token_indices,
+                layer0_probs=group.probs,
+                layer0_topk=group.current_topk,
+                topk=args.predictor_topk,
+            )
+            global_state_by_batch[group.batch_id] = predictions
+
+        if args.global_scheduler_mode in {"dali", "hybrid"}:
+            dali_plan = select_dali_working_set_plan(
+                layer_id=group.layer_id,
+                token_positions=[(0, t) for t in group.token_indices],
+                predictions=global_state_by_batch.get(group.batch_id, {}),
+                lookahead=args.prefetch_lookahead,
+                budget=args.prefetch_budget,
+                confidence_threshold=args.global_confidence_threshold,
+                min_margin=args.global_min_margin,
+                horizon_decay=args.global_horizon_decay,
+                resident_keys=set(cache.entries.keys()),
+                protected_keys=current_active_keys(group),
+                max_keys_per_layer=args.global_max_keys_per_layer,
+            )
+
+            if args.global_scheduler_mode == "hybrid":
+                protected = current_active_keys(group)
+                cache.score_update(dict(dali_plan))
+                cache.demote_outside_working_set(
+                    {key for key, _score in dali_plan},
+                    protected=protected,
+                    factor=0.9,
+                )
+                scored_plan = select_weighted_global_prefetch_plan(
+                    layer_id=group.layer_id,
+                    token_positions=[(0, t) for t in group.token_indices],
+                    predictions=global_state_by_batch.get(group.batch_id, {}),
+                    lookahead=args.prefetch_lookahead,
+                    budget=args.prefetch_budget,
+                    confidence_threshold=args.global_confidence_threshold,
+                    min_margin=args.global_min_margin,
+                    horizon_decay=args.global_horizon_decay,
+                    resident_keys=set(cache.entries.keys()),
+                    protected_keys=protected,
+                    max_keys_per_layer=args.global_max_keys_per_layer,
+                )
+                cache.prefetch_scored(scored_plan, protected=protected, allow_evict=True)
+            else:
+                cache.rebalance_working_set(
+                    dali_plan,
+                    protected=current_active_keys(group),
+                    allow_evict=True,
+                )
+        else:
+            scored_plan = select_weighted_global_prefetch_plan(
+                layer_id=group.layer_id,
+                token_positions=[(0, t) for t in group.token_indices],
+                predictions=global_state_by_batch.get(group.batch_id, {}),
+                lookahead=args.prefetch_lookahead,
+                budget=args.prefetch_budget,
+                confidence_threshold=args.global_confidence_threshold,
+                min_margin=args.global_min_margin,
+                horizon_decay=args.global_horizon_decay,
+                resident_keys=set(cache.entries.keys()),
+                protected_keys=current_active_keys(group),
+                max_keys_per_layer=args.global_max_keys_per_layer,
+            )
+            cache.prefetch_scored(
+                scored_plan,
+                protected=current_active_keys(group),
+                allow_evict=True,
+            )
+
+    elif policy == "oracle":
+        oracle_keys = oracle_prefetch_keys(
+            group,
+            max_horizon=args.prefetch_lookahead,
+            max_keys=args.prefetch_budget,
+        )
+        cache.prefetch(oracle_keys, protected=current_active_keys(group))
+
+    compute_group(group, cache, args.hidden_size, device, dtype)
+\end{CodeBlock}
+
+\section{双流 overlap 集成逻辑}
+该部分展示视觉流与主流如何在推理时并行执行，并在关键位置完成同步与结果回填。
+\begin{CodeBlock}
+def forward(
+    self,
+    input_ids: torch.Tensor,
+    positions: torch.Tensor,
+    intermediate_tensors: IntermediateTensors | None = None,
+    inputs_embeds: torch.Tensor | None = None,
+    **kwargs: object,
+) -> torch.Tensor | IntermediateTensors:
+
+    pixel_values = kwargs.get("pixel_values")
+    image_grid_thw = kwargs.get("image_grid_thw")
+
+    if not get_pp_group().is_first_rank or pixel_values is None or self.visual is None:
+        return super().forward(input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs)
+
+    with torch.cuda.stream(self.vision_stream):
+        h, cu, r_cos, r_sin, m_seq = self.visual._prepare_vision_inputs(
+            pixel_values, image_grid_thw
+        )
+        mid_h = self.visual.forward_stage1(h, cu, r_cos, r_sin, m_seq)
+
+    if inputs_embeds is None:
+        inputs_embeds = self.language_model.model.embed_input_ids(input_ids)
+
+    torch.cuda.current_stream().wait_stream(self.vision_stream)
+
+    merged_h, m_cos, m_sin, m_cu, m_max = self.visual.excute_semantic_merge(
+        mid_h, inputs_embeds, r_cos, r_sin
+    )
+
+    with torch.cuda.stream(self.vision_stream):
+        final_vision_features = self.visual.forward_stage2(
+            merged_h.unsqueeze(1), m_cu, m_cos, m_sin, m_max
+        )
+
+    if self.use_deepstack:
+        deepstack_input_embeds = self._get_deepstack_input_embeds(inputs_embeds.size(0))
+    else:
+        deepstack_input_embeds = None
+
+    torch.cuda.current_stream().wait_stream(self.vision_stream)
+
+    if kwargs.get("image_input_mask") is not None:
+        original_mask = kwargs["image_input_mask"]
+        full_res_feat = torch.zeros(
+            original_mask.sum(),
+            final_vision_features.size(-1),
+            device=final_vision_features.device,
+            dtype=final_vision_features.dtype,
+        )
+        flat_vision_feat = final_vision_features.reshape(-1, final_vision_features.size(-1))
+        full_res_feat[:flat_vision_feat.size(0)] = flat_vision_feat
+        inputs_embeds[original_mask] = full_res_feat
+
+    hidden_states = self.language_model.model(
+        input_ids=None,
+        positions=positions,
+        intermediate_tensors=intermediate_tensors,
+        inputs_embeds=inputs_embeds,
+        deepstack_input_embeds=deepstack_input_embeds,
+    )
+
+    if inputs_embeds is not None:
+        self._clear_deepstack_input_embeds(inputs_embeds.size(0))
+
+    return hidden_states
+\end{CodeBlock}

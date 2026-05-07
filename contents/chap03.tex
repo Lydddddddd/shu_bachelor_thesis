@@ -1,0 +1,256 @@
+% !Mode:: "TeX:UTF-8"
+\chapter{面向 Visual Encoder 的多模态感知优化方法}
+\label{chap:encoder}
+
+\section{设计目标与总体思路}
+第二章的分析表明，VL-MoE 推理链路中的前端视觉处理是影响首字延迟的重要瓶颈。一方面，多模态请求中的图像 Token 数量远高于文本 Token 数量，导致 Visual Encoder 在推理开始阶段承担了大部分前端计算负载；另一方面，视觉特征提取通常发生在生成首个输出 Token 之前，难以通过后续解码过程掩盖等待时间。因此，若希望显著降低 TTFT，仅依赖后端 MoE 调度优化是不够的，必须首先从视觉侧降低冗余计算开销。
+
+然而，Visual Encoder 优化并不能简单理解为“尽可能删除更多 Token”。对于多模态模型而言，视觉 Token 不仅承担图像内容表示，还会在后续跨模态交互中影响文本生成质量。如果压缩策略忽略文本问题本身的语义需求，就容易误删与问题强相关的局部区域，进而造成任务精度下降。由此可见，Visual Encoder 优化需要同时满足两个目标：其一，在保持关键信息不丢失的前提下尽量减少视觉 Token 数量；其二，使压缩过程与后续推理流程相协调，尽可能通过异步执行进一步压缩端到端时延。
+
+基于上述考虑，本文提出一种面向 VL-MoE 的多模态感知视觉优化方法，其核心思想可以概括为“语义引导的自适应 Token 压缩 + 面向实时推理的异步流水执行”。
+其中，前者利用文本查询对视觉 Token 进行语义打分与自适应筛选，在输入进入 MoE 主干网络之前尽可能去除低信息密度区域；后者将视觉编码过程拆分为两个阶段，并利用独立 CUDA 流与文本侧处理并发执行，从而减少前端阻塞时间。
+整体框架如图~\ref{fig:sat-tome-framework} 所示。
+
+\begin{figure}[!htbp]
+\centering
+\includegraphics[width=\textwidth]{sat_tome_framework.png}
+\caption{基于文本引导的自适应视觉 Token 压缩框架}
+\label{fig:sat-tome-framework}
+\end{figure}
+
+为了便于后续描述，设输入图像经过 Patch Embedding 和若干视觉层编码后得到视觉 Token 序列
+\begin{equation}
+X_{\mathrm{vis}} = [v_1, v_2, \ldots, v_N] \in \mathbb{R}^{N \times d_v},
+\end{equation}
+其中 $N$ 表示视觉 Token 数量，$d_v$ 表示视觉特征维度。设文本侧经过编码或聚合后得到全局文本特征
+\begin{equation}
+T_{\mathrm{feat}} \in \mathbb{R}^{1 \times d_t},
+\end{equation}
+其中 $d_t$ 为文本特征维度。第三章的目标是在保证多模态语义对齐能力基本不变的前提下，构造更短的视觉 Token 序列
+\begin{equation}
+X_{\mathrm{red}} \in \mathbb{R}^{K \times d_v}, \qquad K < N,
+\end{equation}
+并使其能够无缝接入后续 VL-MoE 主干网络。
+
+围绕这一目标，本文在第三章中重点解决以下三个问题：
+\begin{enumerate}
+\item 如何利用文本语义识别当前问题真正需要关注的视觉区域，而不是做与任务无关的静态裁剪；
+\item 如何根据样本语义分布的集中程度动态调整压缩强度，而不是对所有请求采用固定压缩率；
+\item 如何将 Token 压缩嵌入到实时推理流程中，与文本侧计算和视觉剩余层计算形成重叠，从而进一步降低 TTFT。
+\end{enumerate}
+
+\section{语义感知的视觉 Token 压缩方法}
+\subsection{问题定义与设计动机}
+多模态推理中的视觉冗余主要来自两个方面。第一，图像通常包含大量背景区域、重复纹理或与问题无关的局部内容，这些内容虽然会被编码为视觉 Token，但对最终回答贡献有限。第二，不同请求对图像关注的区域并不相同，同一幅图像在“数人数”和“判断场景”两类任务下的重要区域可能完全不同。因此，如果仍采用固定规则压缩视觉 Token，就难以兼顾效率与效果。
+
+图~\ref{fig:semantic-guidance-example} 给出了一个直观示例：当问题为“有多少人在运动”时，模型更应保留与人物主体相关的视觉区域；而当问题变为“她们在进行什么运动”时，球和局部动作区域的重要性又会显著上升。由此可见，视觉 Token 的保留策略应当显式结合文本语义，而不能仅仅根据图像本身的静态结构进行统一裁剪或合并。
+
+\begin{figure}[!htbp]
+\centering
+\includegraphics[width=\textwidth]{semantic_token_guidance_example.png}
+\caption{不同文本问题下语义相关视觉 Token 的保留重点示意图}
+\label{fig:semantic-guidance-example}
+\end{figure}
+
+针对这一问题，本文引入文本引导的语义打分机制。基本思想是：将文本查询映射到视觉特征空间中，测量每个视觉 Token 与文本语义的相关性，再依据语义分布的集中程度自适应确定保留 Token 数量。这样既能够优先保留与当前问题强相关的局部区域，又能够根据不同样本的语义复杂度动态调整压缩力度。
+
+\subsection{文本引导的语义相关性建模}
+为了在视觉空间中刻画“当前问题与图像局部内容的匹配程度”，本文首先将文本全局特征投影到视觉维度，得到文本查询向量
+\begin{equation}
+w_t = \phi(T_{\mathrm{feat}}) \in \mathbb{R}^{1 \times d_v},
+\end{equation}
+其中 $\phi(\cdot)$ 表示线性投影层。随后，对每个视觉 Token $v_i$ 计算其与文本查询的余弦相似度
+\begin{equation}
+s_i = \frac{w_t \cdot v_i}{\|w_t\| \, \|v_i\|}, \qquad i = 1,2,\ldots,N.
+\label{eq:similarity}
+\end{equation}
+由此得到语义相关性分数向量
+\begin{equation}
+S = [s_1, s_2, \ldots, s_N] \in \mathbb{R}^{N}.
+\end{equation}
+
+式~\eqref{eq:similarity} 的含义可以理解为：若某个视觉 Token 对应的图像区域与当前文本问题高度相关，则其在投影后的语义空间中会与文本查询方向更接近，从而获得更高的分数；反之，若某个 Token 对应背景、冗余纹理或问题无关区域，则其语义得分较低。
+因此，$S$ 为后续视觉 Token 筛选提供了直接依据。
+
+\subsection{基于熵的自适应压缩率设计}
+仅依赖相似度排序还不足以完成自适应压缩，因为不同请求的语义分布模式可能差异很大。
+例如，当问题只关注图像中的少数目标时，语义分数会集中在少量 Token 上，此时适合采用更高压缩率；而当问题涉及整体场景理解时，更多 Token 会具有中等相关性，此时过强压缩容易造成信息损失。
+
+为此，本文将语义分数归一化为概率分布
+\begin{equation}
+p_i = \frac{\exp(s_i)}{\sum_{j=1}^{N}\exp(s_j)}, \qquad i = 1,2,\ldots,N.
+\label{eq:softmax}
+\end{equation}
+在此基础上定义归一化信息熵
+\begin{equation}
+H(S) = -\frac{1}{\log N} \sum_{i=1}^{N} p_i \log p_i,
+\label{eq:entropy}
+\end{equation}
+其中 $H(S) \in [0,1]$。当 $H(S)$ 较小时，说明语义注意力集中在少数视觉 Token 上；当 $H(S)$ 较大时，说明语义信息分散，需要保留更多视觉内容。
+
+据此，本文定义自适应压缩比例
+\begin{equation}
+R_{\mathrm{adaptive}} = R_{\mathrm{base}} \cdot \left(1 - H(S)\right),
+\label{eq:adaptive-ratio}
+\end{equation}
+其中 $R_{\mathrm{base}}$ 为基础压缩率超参数。由式~\eqref{eq:adaptive-ratio} 可知，当语义分布更集中时，$H(S)$ 更小，自适应压缩比例更高；当语义分布更分散时，$H(S)$ 更大，系统会自动减小压缩力度。
+
+为了避免极端情况下保留 Token 数量过少，本文进一步设置最小保留阈值 $K_{\min}$，并将最终保留 Token 数量定义为
+\begin{equation}
+K = \max \left( K_{\min}, \left\lfloor N \cdot \left(1 - R_{\mathrm{adaptive}}\right) \right\rfloor \right).
+\label{eq:keep-num}
+\end{equation}
+在当前实现中，取 $K_{\min}=16$，以确保模型在高压缩率条件下仍保留足够的视觉骨架信息。
+
+\subsection{Token 选择与实现细节}
+在确定保留数量 $K$ 后，本文按照语义分数从高到低选择前 $K$ 个视觉 Token，得到保留索引集合 $\mathcal{I}_{\mathrm{keep}}$。
+仅采用“直接裁剪”虽然可以减少计算，但会完全丢弃被过滤 Token 所携带的信息，容易带来边缘信息缺失和局部语义断裂。
+因此，本文采用“选择 + 重构”的策略：首先保留语义最相关的核心 Token，然后将被移除 Token 的信息以聚合方式补偿到保留 Token 上。
+
+需要说明的是，从方法原理上，式~\eqref{eq:reconstruct} 所示的“选择 + 重构”可以视为更完整的上限形式；但在当前工程版本中，为了降低运行时开销并便于与后续 deepstack 分支对接，SAT-ToMe 模块采用轻量化 Top-K 保留实现，直接返回保留索引 \texttt{keep\_indices}，并同步更新 rotary position embedding 与 \texttt{cu\_seqlens}。被裁剪 Token 的细节信息则主要通过后续多尺度特征分支进行补偿。相关关键代码见附录 A。
+
+记保留 Token 集合为 $\{v_j\}_{j \in \mathcal{I}_{\mathrm{keep}}}$，被裁剪 Token 集合为 $\{v_i\}_{i \in \mathcal{I}_{\mathrm{drop}}}$。
+对于每个被裁剪 Token，按照相似度或邻近关系将其分配给一个保留 Token，并使用归一化权重进行聚合，得到重构后的保留 Token
+\begin{equation}
+\tilde{v}_j = v_j + \sum_{i \in \mathcal{A}(j)} \alpha_{ij} v_i,
+\label{eq:reconstruct}
+\end{equation}
+其中 $\mathcal{A}(j)$ 表示分配给第 $j$ 个保留 Token 的被裁剪 Token 集合，$\alpha_{ij}$ 为归一化聚合权重。
+最终得到压缩后的视觉表示
+\begin{equation}
+X_{\mathrm{red}} = [\tilde{v}_1, \tilde{v}_2, \ldots, \tilde{v}_K] \in \mathbb{R}^{K \times d_v}.
+\end{equation}
+
+该设计兼顾了压缩效率与语义保持能力：高相关区域被显式保留，低相关区域的信息则通过特征聚合以低成本回流到核心 Token 中，从而降低纯裁剪带来的信息断裂风险。
+
+\subsection{理论复杂度分析}
+在视觉 Transformer 中，自注意力开销通常与 Token 数量的平方成正比。若原始视觉 Token 数量为 $N$，压缩后数量为 $K$，则注意力主导部分的复杂度可由
+\begin{equation}
+\mathcal{O}(N^2 d_v)
+\end{equation}
+降低为
+\begin{equation}
+\mathcal{O}(K^2 d_v).
+\end{equation}
+因此，仅从注意力计算角度看，理论加速比近似为
+\begin{equation}
+\frac{N^2}{K^2} = \left(\frac{N}{K}\right)^2.
+\end{equation}
+当 $K/N$ 下降到较小范围时，Visual Encoder 的理论开销会显著下降。
+与此同时，后续模态融合和部分跨模态计算也会因为视觉 Token 数量减少而进一步受益。
+
+\section{面向实时推理的异步流水优化方法}
+\subsection{设计动机}
+视觉 Token 压缩可以降低单位样本计算量，但如果压缩过程本身仍然完全串行地嵌入到推理链路中，那么端到端等待时间仍然难以充分压缩。
+尤其在在线推理场景下，文本嵌入、视觉编码、模态融合和后续 LLM 推理原本存在一定程度的可重叠空间。若能够显式挖掘这些重叠机会，就可以在“减少计算量”之外进一步实现“隐藏等待时间”。
+
+基于这一考虑，本文在 Encoder 优化中引入面向实时推理的双流异步流水机制。其核心思路是：将视觉编码拆分为两个阶段，在视觉流中执行视觉预处理和分段编码；同时在主流中并发执行文本嵌入与后续准备操作；在必要节点通过轻量同步保证数据一致性，从而尽可能扩大计算重叠范围。整体执行过程如图~\ref{fig:encoder-pipeline} 所示。
+
+\begin{figure}[!htbp]
+\centering
+\includegraphics[width=\textwidth]{encoder_pipeline.png}
+\caption{面向实时推理的 Visual Encoder 异步流水执行过程}
+\label{fig:encoder-pipeline}
+\end{figure}
+
+\subsection{双阶段视觉编码结构}
+为了兼顾压缩时机与实现复杂度，本文将视觉编码过程划分为两个阶段：
+\begin{enumerate}
+\item Stage 1：完成视觉预处理以及前若干层视觉编码，生成具有初步语义结构的中间视觉表示；
+\item Stage 2：在完成 SAT-ToMe 语义自适应压缩后，对保留 Token 继续执行剩余视觉层计算，并提取多尺度增强特征。
+\end{enumerate}
+
+将 Token 压缩放置在 Stage 1 与 Stage 2 之间，具有两个优点。首先，此时视觉 Token 已经过若干层编码，局部语义结构较输入阶段更稳定，文本引导打分更可靠；其次，后续剩余层的计算量更高，在此之前完成压缩可以获得更明显的时延收益。
+
+\subsection{主流与视觉流的异步重叠}
+本文使用 \texttt{torch.cuda.Stream} 为视觉侧构建独立的 \texttt{vision\_stream}，使其与默认 \texttt{main\_stream} 并发执行。
+具体而言，主流主要负责文本嵌入计算、后续多模态主干准备以及最终 LLM 推理，视觉流则负责视觉预处理、Stage 1 编码、SAT-ToMe 压缩和 Stage 2 编码。
+在工程实现上，原始 \texttt{forward} 被拆分为 \texttt{\_prepare\_vision\_inputs}、\texttt{forward\_stage1}、\texttt{excute\_semantic\_merge} 和 \texttt{forward\_stage2} 四个阶段，便于在视觉流与主流之间显式插入 overlap 点和同步点。
+
+在时间轴上，系统执行过程可以概括为以下步骤：
+\begin{enumerate}
+\item 主流启动文本 Embedding 计算，视觉流并发启动图像预处理与 Stage 1 计算；
+\item 当主流文本特征可用且视觉流 Stage 1 结束后，触发文本引导的 SAT-ToMe 压缩；
+\item 压缩后视觉流继续执行 Stage 2 计算，同时主流准备后续融合与推理步骤；
+\item 在最终视觉特征准备完毕后，主流获取视觉结果并继续执行多模态主干与解码。
+\end{enumerate}
+
+该设计的关键不在于完全消除同步，而在于将同步点限制在真正需要交换信息的位置。与完全串行执行相比，大量视觉侧计算可以与文本侧准备过程并发完成，从而缩短用户感知到的整体等待时间。
+
+\subsection{特征增强与最终表示构造}
+在视觉 Token 被压缩后，模型虽然保留了主要语义区域，但仍可能丢失部分中低层细节信息。
+为了缓解这一问题，本文在 Stage 2 中引入多尺度特征提取机制，从若干中间层中抽取辅助视觉表示，并在最终输出阶段与主分支结果进行拼接。
+设 Stage 2 的最终输出为 $H_{\mathrm{stage2}}$，多尺度辅助特征为 $F_{\mathrm{deep1}}, F_{\mathrm{deep2}}, \ldots$，则最终视觉表示构造为
+\begin{equation}
+H_{\mathrm{final}} = \left[ H_{\mathrm{stage2}} \,\|\, F_{\mathrm{deep1}} \,\|\, F_{\mathrm{deep2}} \,\|\, \cdots \right],
+\label{eq:h-final}
+\end{equation}
+其中 $\|$ 表示特征拼接操作。
+
+式~\eqref{eq:h-final} 的目的并不是增加额外复杂分支，而是在较低代价下保留多尺度视觉线索，从而补偿高压缩率下可能损失的细节信息。对于文档理解、区域感知或细粒度问答等任务，这种增强策略尤其重要。
+
+\subsection{同步机制与工程实现要点}
+为了保证异步流水的正确性，本文在以下两个位置引入必要同步：
+\begin{enumerate}
+\item 在 Stage 1 完成并且文本特征就绪后，同步两条流以执行文本引导的 SAT-ToMe 压缩；
+\item 在 Stage 2 与多尺度增强特征完成后，同步视觉流与主流，使最终视觉表示能够安全输入后续多模态主干网络。
+\end{enumerate}
+
+此外，在工程实现中还需要处理以下问题：
+\begin{enumerate}
+\item 变长序列重建：视觉 Token 压缩后，每个样本的有效长度可能不同，因此需要重新构建 `cu\_seqlens` 和 `max\_seqlen`，以适配后续高效注意力算子；
+\item 缓冲区复用：为减少额外显存碎片，Stage 1 输出、中间保留索引和 Stage 2 输入缓冲区应尽量复用；
+\item 与主干接口兼容：压缩后的视觉表示维度需与后续模态融合模块保持兼容，避免额外的投影或数据搬移开销。
+\end{enumerate}
+
+\section{方法实现与复杂度分析}
+\subsection{与推理框架的集成方式}
+本文的方法在实现上遵循“尽量少改主干、尽量早做压缩、尽量充分重叠”的原则。
+在系统集成时，Visual Encoder 优化模块部署在视觉前端与多模态主干之间，并主要包含以下几个子模块：
+\begin{enumerate}
+\item 文本特征提取模块：负责生成全局文本查询向量，用于视觉 Token 语义打分；
+\item SAT-ToMe 压缩模块：负责根据语义分数与熵计算结果动态确定保留 Token 集合，并输出保留索引供后续位置编码与序列长度更新使用；
+\item 视觉双阶段流水模块：负责执行视觉流与主流之间的并发调度及同步；
+\item 多尺度特征增强模块：负责从剩余视觉层中提取补充特征并构造最终视觉表示。
+\end{enumerate}
+
+从接口角度看，该优化仅修改视觉编码前端和视觉特征输出形式，不改变后续 VL-MoE 主干网络的基本结构，因此具有较好的系统兼容性。对于实际部署而言，这种设计也便于逐步启用和独立评估。
+本章的关键实现代码整理于附录 A，正文仅保留方法说明和调度逻辑。
+
+\subsection{时间复杂度与空间复杂度}
+第三章方法的额外开销主要来自文本引导相似度计算、熵计算和 Token 聚合。
+设文本特征维度投影后与视觉维度一致为 $d_v$，则相似度打分复杂度约为
+\begin{equation}
+\mathcal{O}(N d_v),
+\end{equation}
+Softmax 与熵计算复杂度约为
+\begin{equation}
+\mathcal{O}(N),
+\end{equation}
+聚合重构复杂度与被压缩 Token 数量线性相关，约为
+\begin{equation}
+\mathcal{O}((N-K)d_v).
+\end{equation}
+与后续视觉自注意力主导的平方级复杂度相比，这些额外开销处于较低量级，因此在理论上是值得的。
+
+空间开销方面，方法需要额外存储语义分数向量、保留索引和少量中间聚合缓冲区，其开销近似为
+\begin{equation}
+\mathcal{O}(N + K + N d_v^{\prime}),
+\end{equation}
+其中 $d_v^{\prime}$ 表示中间辅助缓冲区的有效维度。由于这些额外存储远小于原始全量视觉注意力缓存和后续主干状态，因此总体显存压力仍以压缩带来的节省为主。
+
+\subsection{方法优势与局限性讨论}
+本文第三章方法的主要优势体现在以下三个方面：
+\begin{enumerate}
+\item 压缩决策由文本语义直接驱动，能够适应不同问题下的区域关注差异；
+\item 压缩率通过信息熵自适应调整，避免固定比例裁剪在复杂样本上带来的信息损失；
+\item 通过视觉流与主流的异步重叠，不仅减少了计算量，还减少了端到端等待时间。
+\end{enumerate}
+
+与此同时，该方法也存在一定局限性。首先，当文本问题本身较短或语义信息不足时，全局文本特征对视觉区域的指导能力可能受限；其次，若输入图像包含大量细粒度信息，高压缩率仍可能对精度造成影响；再次，异步流水设计依赖较强的工程实现能力，在不同推理框架中迁移时可能需要适配底层执行接口。
+这些问题将在第五章的实验部分通过效果对比和消融实验进一步讨论。
+
+\section{本章小结}
+本章针对 VL-MoE 推理中 Visual Encoder 前端开销较高的问题，提出了面向多模态感知的视觉优化方法。首先，本文利用文本引导的语义相关性建模，为视觉 Token 提供任务相关的打分依据；随后，基于归一化信息熵设计自适应压缩率，使系统能够根据不同样本的语义分布动态调整压缩强度；在此基础上，本文进一步将压缩模块嵌入到双阶段视觉编码和双流异步执行过程中，通过重叠视觉处理与文本侧准备来进一步降低 TTFT。
+
+从方法定位上看，第三章解决的是第二章中识别出的第一类核心问题，即视觉侧冗余计算导致的前端高时延。后续第四章将在此基础上，继续针对 MoE 专家路由的跨层可预测性设计专家提前调度方法，与本章形成互补。

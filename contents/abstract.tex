@@ -1,0 +1,39 @@
+\newpage
+
+\setcounter{page}{1} % skip the content page
+
+{
+\let\clearpage\relax
+\chapter*{摘\ 要}
+}
+\addcontentsline{toc}{chapter}{摘\ 要}
+
+近年来，多模态大模型与混合专家模型（Mixture of Experts, MoE）结合后，在视觉问答、文档理解与复杂图文推理等任务上表现出较强能力，但其推理阶段同时面临视觉前端开销大、专家路由动态性强以及显存受限部署困难等问题。针对这一背景，本文围绕 VL-MoE 推理优化展开研究，重点从视觉侧和专家侧两个方向提升系统效率。
+
+在视觉侧，本文提出面向多模态推理的语义感知视觉 Token 压缩与异步流水优化方法。该方法利用文本语义对视觉区域进行相关性打分，并根据语义分布的集中程度自适应调整压缩率，在保留关键信息的同时减少冗余视觉计算；同时将视觉编码拆分为可并发执行的阶段，与文本侧准备过程形成重叠，以降低首字延迟。
+
+在专家侧，本文重新采集 Qwen3-VL 的 fresh 路由 trace，构建包含 layer-0 router 概率、Top-$k$ 专家、token 位置、输入 id 与模态标识等特征的全局预测数据集，并训练 layer-0 条件化的全局路由预测器。该预测器在验证集上的 best mean recall 达到 0.7219。基于预测结果，本文进一步设计了 ExpertFlow 风格的加权预取、DALI 风格的 working-set 重排以及 Hybrid 融合调度策略，用于在 CPU-GPU expert offload 场景下提前加载高概率专家、降低同步等待和传输开销。
+
+实验结果表明，视觉侧优化在 MMBench 与 MME 子集上的归一化任务分数均保持在 0.995 以上，未造成明显模型效果下降；同时将 Visual Encoder 可见耗时从 8572ms 降至 800ms，使整体 TTFT 获得约 1.63x 加速。在真实 CPU-GPU expert offload 微基准上，预测式调度相较 demand 策略能够显著减少专家加载时延；在代表性设置 cap96\_g12\_t64 和 cap160\_g20\_t64 下，predictor 相对 demand 的加速比分别达到 2.99x 和 2.66x。进一步的调度对比实验显示，在 GPU expert cache 容量为 128 时，ExpertFlow、DALI 和 Hybrid 三种策略均可稳定获得约 2.52x 以上的整体加速。本文工作为 VL-MoE 在资源受限场景下的高效部署提供了可行的系统实现路径。
+
+\vspace{8mm}
+\textbf{关键词}: VL-MoE；Visual Encoder；专家预测；专家调度；CPU-GPU offload
+
+\newpage
+{
+\let\clearpage\relax
+\chapter*{ABSTRACT}
+}
+\addcontentsline{toc}{chapter}{ABSTRACT}
+
+Vision-language mixture-of-experts (VL-MoE) models have shown strong performance on visual question answering, document understanding, and multimodal reasoning, but their inference pipeline still suffers from expensive visual encoding, dynamic expert routing, and difficult deployment under limited GPU memory. This thesis studies inference optimization for VL-MoE from two complementary perspectives: the visual front end and the expert side.
+
+On the visual side, a semantic-aware token compression method is introduced for multimodal inference. It scores visual tokens with text-guided relevance, adapts the compression ratio according to semantic concentration, and overlaps the visual pipeline with text preparation to reduce TTFT.
+
+On the expert side, a fresh Qwen3-VL routing dataset is collected and used to train a layer-0 conditioned global route predictor with features such as router probabilities, top-$k$ experts, token positions, input ids, and modality flags. The predictor reaches a best mean recall of 0.7219 on the validation set. Based on its outputs, three scheduling policies are designed: an ExpertFlow-style weighted prefetch policy, a DALI-style working-set rebalance policy, and a hybrid policy for CPU-GPU expert offload.
+
+Experiments show that the visual-side optimization keeps normalized task scores above 0.995 on MMBench and MME subsets while reducing the visible Visual Encoder latency from 8572 ms to 800 ms, leading to about 1.63x TTFT speedup. On a real CPU-GPU expert offload microbenchmark, the predictor significantly reduces synchronous expert loading. On representative settings cap96\_g12\_t64 and cap160\_g20\_t64, the predictor achieves 2.99x and 2.66x speedup over demand, respectively. Further scheduler comparisons at GPU cache capacity 128 show that ExpertFlow, DALI, and Hybrid all provide stable speedups of about 2.52x or higher. The proposed methods provide a practical path for efficient VL-MoE deployment under memory-constrained settings.
+
+\vspace{8mm}
+
+\textbf{Keywords}: VL-MoE; Visual Encoder; expert prediction; expert scheduling; CPU-GPU offload

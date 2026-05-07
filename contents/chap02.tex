@@ -1,0 +1,204 @@
+% !Mode:: "TeX:UTF-8"
+\chapter{VL-MoE 推理负载特征分析与问题建模}
+\label{chap:analysis}
+
+\section{VL-MoE 模型结构与推理流程}
+VL-MoE 的推理过程并不是单一的语言生成过程，而是由视觉编码、模态融合、专家路由和文本解码等多个阶段共同组成的异构执行链路。
+从输入形式上看，一个典型的多模态请求通常由图像和文本提示词共同构成。图像首先经过视觉编码器提取为视觉特征序列，文本则经过 tokenizer 编码为文本 Token 表示；随后，视觉特征与文本表示在融合模块中对齐，并送入后续的 MoE 主干网络进行联合建模；最后，模型通过自回归解码生成输出结果。
+
+在这一过程中，Visual Encoder 和 MoE Backbone 分别承担了两类不同但同样关键的工作。Visual Encoder 的主要任务是将高维图像输入映射到后续语言模型可消费的视觉 Token 空间，其开销与图像分辨率、Patch 划分方式和视觉 Transformer 深度密切相关。MoE Backbone 则利用 Router 对不同 Token 动态选择专家，并将稀疏计算结果汇聚到主干链路中，以在有限计算预算下获得更强表达能力。
+然而，这种结构也天然带来了两类负担：前者是视觉侧大量 Token 导致的高计算密度，后者是专家动态激活带来的缓存、传输和调度复杂性。
+
+从系统执行视角看，VL-MoE 推理链路可以进一步拆分为以下几个阶段：视觉预处理与编码、文本预处理、模态融合、MoE 层前向计算、专家间通信与同步、输出解码。
+其中，视觉侧主要影响首字延迟，MoE 专家访问则会在 Prefill 和 Decoding 阶段同时带来额外的权重调度与通信压力。
+因此，若要提升 VL-MoE 推理性能，不能仅仅关注某一局部算子的加速，而需要围绕完整推理链路识别负载特征和优化机会。
+
+\section{实验平台、模型与评价指标}
+为了系统分析 VL-MoE 推理负载特征，本文基于真实模型和公开数据集构建实验环境，并结合系统级 profiling 与路由级统计展开分析。
+实验平台与主要配置如表~\ref{tab:exp-setup} 所示。
+
+\begin{table}[!htbp]
+\centering
+\begin{minipage}[t]{0.9\linewidth}
+\caption{实验平台与主要配置}
+\label{tab:exp-setup}
+\begin{tabularx}{\linewidth}{lX}
+\toprule[1.5pt]
+{\heiti 项目} & {\heiti 配置说明} \\
+\midrule[1pt]
+硬件平台 & 4 $\times$ NVIDIA A6000 GPU，单卡显存 48 GB \\
+主要模型 & Qwen3-VL-30B-A3B-Instruct，以及用于对比分析的典型 VL-MoE 模型 \\
+推理框架 & vLLM，部分路由统计实验基于 Hugging Face Transformers 实现 Hook 记录 \\
+分析工具 & Nsight Systems、PyTorch Profiler \\
+评测数据集 & MMBench、MME 等公开多模态评测集 \\
+重点场景 & Prefill、Decoding、专家缓存/预取、资源受限与潜在 offload 场景 \\
+\bottomrule[1.5pt]
+\end{tabularx}
+\end{minipage}
+\end{table}
+
+本文在后续章节中主要采用以下评价指标：
+\begin{enumerate}
+\item 首字延迟（TTFT）：衡量从请求输入到生成首个输出 Token 所需的时间，用于评估前端视觉处理和 Prefill 阶段的时延压力。
+\item 系统吞吐量（Throughput）：衡量单位时间内系统可处理的请求或生成 Token 数量，用于评估整体服务能力。
+\item GPU 显存占用：衡量模型在不同优化策略下的显存需求，用于分析资源受限部署场景的适用性。
+\item 专家缓存命中率与专家传输次数：用于评估预测式调度和专家管理机制是否有效减少了权重搬移。
+\item 任务效果指标：包括公开数据集上的准确率、得分或其他任务效果指标，用于验证优化后模型能力是否保持稳定。
+\end{enumerate}
+
+上述实验设置和评价指标构成了后续分析与优化方法设计的基础。其中，第二章重点回答“瓶颈在哪里”，而第三章和第四章则分别回答“如何优化视觉侧”和“如何优化专家侧”。
+
+\section{多模态输入负载特征分析}
+与纯文本大模型相比，VL-MoE 推理的首要差异在于输入负载构成发生了根本变化。文本输入通常由长度相对有限的离散 Token 组成，而图像输入需要经过切块、嵌入和位置编码等处理后形成数量可观的视觉 Token。为了定量分析这种差异，本文首先统计了 MMBench 和 MME 两个公开数据集上的输入 Token 构成情况。
+
+\begin{figure}[!htbp]
+\centering
+\begin{subfigure}[b]{0.47\textwidth}
+    \centering
+    \includegraphics[width=\textwidth]{token_distribution_mmbench.png}
+    \caption{MMBench 数据集}
+    \label{fig:mmbench-token}
+\end{subfigure}
+\hfill
+\begin{subfigure}[b]{0.47\textwidth}
+    \centering
+    \includegraphics[width=\textwidth]{token_distribution_mme.png}
+    \caption{MME 数据集}
+    \label{fig:mme-token}
+\end{subfigure}
+\caption{公开多模态评测集上的输入 Token 分布}
+\label{fig:token-distribution}
+\end{figure}
+
+由图~\ref{fig:token-distribution} 可以看出，多模态请求中的图像 Token 占据绝对主导地位。
+在 MMBench 数据集上，图像 Token 占比达到 95.08\%，文本 Token 仅占 4.92\%；在 MME 数据集上，图像 Token 占比进一步上升至 98.15\%，文本 Token 仅占 1.85\%。
+这说明，对于典型多模态推理场景而言，系统前端的大部分计算负载首先来自视觉侧而不是语言侧。
+
+这一现象带来的直接后果是：即便模型的最终输出是文本，系统仍必须首先处理大量视觉 Token，导致 Visual Encoder 和前端融合模块在时延路径中占据较大比例。
+同时，由于视觉 Token 数量显著多于文本 Token，图像侧冗余区域、低信息密度 Patch 和无关背景内容也会被一并送入后续模型，进一步放大了无效计算比例。
+因此，从输入负载角度出发，VL-MoE 推理优化的首要任务就是识别并削减视觉侧冗余。
+
+\section{Visual Encoder 侧瓶颈分析}
+在确认多模态输入由视觉 Token 主导之后，下一步需要分析这些 Token 在推理链路中具体造成了怎样的系统压力。
+本文基于 vLLM 和 Nsight Systems 对端到端推理过程进行了 profiling，将执行链路拆分为 Visual Encoder、模态融合与 Prefill、MoE 专家计算以及 All-to-All 通信等阶段。
+
+分析结果表明，Visual Encoder 是影响 TTFT 的关键前端瓶颈之一。
+在当前实验配置下，Visual Encoder 在基线系统的 TTFT 中占比约为 20.6\%，说明即使后端采用了稀疏专家结构，视觉侧仍然是决定多模态首响性能的重要环节。
+其根本原因在于：视觉侧对全部视觉 Token 执行注意力与前馈计算，计算复杂度会随着视觉 Token 数量增长而迅速上升；同时，视觉编码往往发生在生成开始之前，难以像后续解码过程那样通过流式输出掩盖等待时间。
+
+从系统设计角度看，Encoder 瓶颈具有以下特点。第一，它主要集中在推理前端，对用户感知时延影响明显；第二，它与输入分辨率和视觉 Token 数量强相关，不同样本之间波动较大；第三，它与后续 MoE 优化并不冲突，反而是开展端到端协同优化的前提。
+因此，若希望显著降低 VL-MoE 的 TTFT，仅依赖后端路由优化是不够的，必须同时从视觉侧入手，减少冗余 Token 的计算并增强与文本侧执行的重叠程度。
+
+\section{MoE 路由均衡性与跨层相关性分析}
+除视觉侧开销外，VL-MoE 推理的另一个关键问题来自专家路由行为本身。为了分析 MoE 路由的系统特征，本文在 Router 处插入 Hook，对不同请求规模和不同层中的专家激活情况进行统计。
+首先考察单层内部的专家分布均衡性。图~\ref{fig:expert-hotspots} 给出了多组请求规模下专家激活占比最高的前 10 个专家分布。
+
+\begin{figure}[!htbp]
+\centering
+\includegraphics[width=\textwidth]{expert_hotspots.png}
+\caption{不同请求规模下前 10 个激活占比较高专家的分布}
+\label{fig:expert-hotspots}
+\end{figure}
+
+从图~\ref{fig:expert-hotspots} 可以观察到，不同请求规模下各专家的激活占比虽然存在差异，但整体分布并未表现出特别极端的冷热分化。
+前 10 个激活占比较高的专家在不同请求规模下的占比大致稳定在 1\% 左右量级，说明当前分析对象中的专家负载相对均衡，模型训练已经较好地缓解了早期 MoE 模型中常见的“少数热点专家长期拥塞、其余专家长期闲置”的问题。
+这意味着，对于当前这类训练较充分的 VL-MoE 模型而言，单纯依赖显式冷热专家划分开展优化，其收益空间可能会受到限制；换言之，许多以“存在非常明显热点专家”为前提的优化思路，在本文所分析模型上未必仍然是最主要的性能突破口。
+
+然而，单层分布较均衡并不意味着专家路由完全无规律。进一步对相邻层之间的路由转移进行统计后，本文发现专家选择在层级之间仍然存在明显的结构性与路径依赖。
+图~\ref{fig:layer-correlation} 给出了 Layer 10 到 Layer 11 的跨层专家转移结果。其中，图~\ref{fig:layer-correlation-heatmap} 为跨层转移概率热力图，横轴表示下一层被激活的专家编号，纵轴表示前一层被激活的专家编号；图~\ref{fig:layer-correlation-stats} 给出了基于实际激活专家对的统计结果。
+
+\begin{figure}[!htbp]
+\centering
+\begin{subfigure}[b]{0.48\textwidth}
+    \centering
+    \includegraphics[width=\textwidth]{layer_correlation_heatmap.jpeg}
+    \caption{Layer 10 $\rightarrow$ 11 的跨层转移概率热力图}
+    \label{fig:layer-correlation-heatmap}
+\end{subfigure}
+\hfill
+\begin{subfigure}[b]{0.48\textwidth}
+    \centering
+    \small
+    \renewcommand{\arraystretch}{1.18}
+    \setlength{\tabcolsep}{6pt}
+    \begin{tabular}{ccc}
+    \hline
+    {\heiti Top 比例} & {\heiti 专家对数量} & {\heiti 激活覆盖率} \\
+    \hline
+    Top 1\%   & 26/2537   & 8.85\% \\
+    Top 5\%   & 127/2537  & 24.36\% \\
+    Top 10\%  & 254/2537  & 36.11\% \\
+    Top 20\%  & 508/2537  & 51.77\% \\
+    Top 30\%  & 762/2537  & 61.57\% \\
+    Top 40\%  & 1015/2537 & 70.64\% \\
+    Top 50\%  & 1269/2537 & 75.54\% \\
+    Top 80\%  & 2030/2537 & 90.22\% \\
+    Top 100\% & 2537/2537 & 100.00\% \\
+    \hline
+    \end{tabular}
+    \caption{跨层激活专家对统计结果}
+    \label{fig:layer-correlation-stats}
+\end{subfigure}
+\caption{相邻层之间的专家路由相关性分析}
+\label{fig:layer-correlation}
+\end{figure}
+
+从图~\ref{fig:layer-correlation-heatmap} 可以看出，虽然整体颜色较浅，说明不存在单个专家对占据压倒性优势的情况，但热力图中仍然出现了若干稳定的条纹和局部增强区域，这表明某些“前一层专家 $\rightarrow$ 后一层专家”的转移关系会更频繁地出现，而并非完全随机均匀扩散。
+从图~\ref{fig:layer-correlation-stats} 的量化结果看，Layer 10 到 Layer 11 实际出现的专家对总数为 2537，而理论上可组合的专家对总容量为 16384，对应稀疏度达到 84.52\%。这说明大量跨层专家对在实际运行中根本不会出现，真正活跃的转移路径只占全部可能路径的一小部分。
+进一步地，在这 2537 个实际出现的专家对中，前 1\% 的专家对已经覆盖 8.85\% 的激活，前 10\% 的专家对覆盖 36.11\% 的激活，前 20\% 的专家对覆盖 51.77\% 的激活。
+这表明，尽管单层专家使用已经较为均衡，但跨层转移路径仍然具有明显的统计集中性和可预测性。
+
+这一发现对后续优化设计具有直接启发意义。既然单层内部没有特别明显的冷热专家，那么仅围绕“哪些专家更热”进行静态缓存优化的效果会受到限制；但如果能够利用当前层或历史层的路由结果，预测下一层更可能激活的专家集合，就仍然可以提前开展专家预取、缓存调整和调度重叠，从而减少同步等待和无效传输。
+从多模态角度看，图像 Token 与文本 Token 在语义结构和上下文依赖上存在差异，因此它们在跨层路由路径上也可能表现出不同模式。这进一步说明，相比仅关注单层热点，基于跨层可预测性的专家提前调度更适合作为后续研究重点。
+
+结合前文对 Visual Encoder 的分析可以看到，VL-MoE 推理瓶颈并不是单点问题，而是由前端视觉开销和后端专家调度共同构成的复合问题。
+前者决定了首字延迟的基线水平，后者决定了稀疏结构在真实部署中的可兑现效率。因此，后续优化设计必须同时覆盖这两个方向。
+
+\begin{table}[!htbp]
+\centering
+\begin{minipage}[t]{0.92\linewidth}
+\caption{VL-MoE 推理中的主要瓶颈与现象总结}
+\label{tab:bottleneck-summary}
+\begin{tabularx}{\linewidth}{lX}
+\toprule[1.5pt]
+{\heiti 瓶颈类型} & {\heiti 主要表现} \\
+\midrule[1pt]
+输入负载失衡 & 图像 Token 在公开多模态评测集中的占比超过 95\%，视觉侧成为主要负载来源。 \\
+视觉编码开销高 & Visual Encoder 在 TTFT 中占比较高，且随视觉 Token 数量增长而显著上升。 \\
+单层专家分布较均衡 & 各专家激活占比整体较为平滑，没有特别极端的冷热专家分化，说明模型训练已较好缓解负载失衡。 \\
+专家路由动态性强 & 不同请求和不同层的激活专家集合不断变化，增加了缓存与预取难度。 \\
+跨层转移存在结构性 & 相邻层之间的专家转移路径具有明显稀疏性和统计相关性，为预测式调度提供了依据。 \\
+模态行为异质 & 图像 Token 与文本 Token 在路由模式、活跃专家和调度需求上存在差异。 \\
+\bottomrule[1.5pt]
+\end{tabularx}
+\end{minipage}
+\end{table}
+
+\section{问题建模与优化目标}
+基于以上 profiling 结果，本文将 VL-MoE 推理优化问题抽象为在精度约束和资源约束下的端到端时延最小化问题。
+设一次多模态请求的总推理时延为 $L$，则可近似表示为
+\begin{equation}
+L = T_{\mathrm{enc}} + T_{\mathrm{fuse}} + T_{\mathrm{route}} + T_{\mathrm{expert}} + T_{\mathrm{comm}} + T_{\mathrm{decode}},
+\end{equation}
+其中 $T_{\mathrm{enc}}$ 表示视觉编码开销，$T_{\mathrm{fuse}}$ 表示模态融合开销，$T_{\mathrm{route}}$ 表示路由决策相关开销，$T_{\mathrm{expert}}$ 表示专家前向计算开销，$T_{\mathrm{comm}}$ 表示专家权重加载、传输和同步带来的通信开销，$T_{\mathrm{decode}}$ 表示最终解码阶段的开销。
+
+在上述分解中，第二章的分析已经表明 $T_{\mathrm{enc}}$ 和 $T_{\mathrm{comm}}$ 是当前系统中最具优化价值的两个部分。
+因此，本文将优化目标进一步细化为以下两个方面：
+\begin{enumerate}
+\item 在保证模型输出质量基本不变的前提下，尽可能降低视觉侧冗余计算，即压缩 $T_{\mathrm{enc}}$；
+\item 在不显著增加额外预测成本的前提下，提高高概率跨层转移路径对应专家的缓存命中率并减少专家搬移次数，即压缩 $T_{\mathrm{route}} + T_{\mathrm{comm}}$。
+\end{enumerate}
+
+与此同时，实际部署场景还要求优化方法满足以下约束：
+\begin{equation}
+\Delta \mathrm{Acc} \leq \varepsilon, \qquad
+M \leq M_{\mathrm{budget}},
+\end{equation}
+其中 $\Delta \mathrm{Acc}$ 表示优化后模型效果的下降幅度，$\varepsilon$ 为可接受误差上界，$M$ 为运行显存占用，$M_{\mathrm{budget}}$ 为部署环境可提供的显存预算。
+
+基于这一建模，后续章节的整体设计逻辑可以概括如下：第三章重点解决 $T_{\mathrm{enc}}$ 过大的问题，通过视觉 Token 压缩与异步流水降低前端开销；第四章重点解决 $T_{\mathrm{route}} + T_{\mathrm{comm}}$ 的问题，通过专家预测、预取与差异化调度降低专家访问和通信代价。两者共同服务于整体推理时延的下降与资源利用率的提升。
+
+\section{本章小结}
+本章围绕 VL-MoE 推理链路展开了负载特征分析与问题建模。首先，从模型结构与系统流程角度说明了多模态推理与纯文本推理的差异；其次，通过实验平台和评价指标的设定，为后续分析与实验奠定基础；随后，基于公开数据集和真实模型的 profiling 结果，分析了输入负载、Visual Encoder 开销、单层专家分布均衡性以及跨层路由相关性等关键现象，明确指出 VL-MoE 推理存在“视觉侧负担重、专家侧跨层动态性强”的双重瓶颈。
+
+在此基础上，本文进一步将优化目标归纳为两个主要方向：一是面向 Visual Encoder 的多模态感知加速，二是面向 MoE 的基于可预测性的专家提前调度。后续章节将分别围绕这两个方向展开方法设计与实现。
