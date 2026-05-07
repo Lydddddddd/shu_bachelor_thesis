@@ -5,7 +5,7 @@
 \section{实验设置}
 第五章主要验证第三章提出的 Visual Encoder 侧优化方法和第四章提出的全局预测与专家调度方法是否能够在真实推理场景中带来收益。实验对象为 Qwen3-VL-30B-A3B-Instruct，其中视觉侧实验关注语义感知 Token 压缩与异步流水对任务效果和 TTFT 的影响；专家侧实验关注 MoE 路由预测、CPU-GPU expert offload 与缓存调度收益。专家预测器使用第四章重新采集的 fresh 路由数据训练得到。
 
-本文采用三类实验：
+本文实验主要包括以下部分：
 \begin{enumerate}
     \item \textbf{Visual Encoder 优化实验}：验证第三章的 SAT-ToMe 与异步流水策略是否在保持模型任务效果稳定的同时降低视觉前端开销；
     \item \textbf{预测器离线评估}：验证全局预测器是否学到了跨层路由规律；
@@ -79,7 +79,7 @@ SAT-ToMe + Pipeline & 25512 & 800 & 3.1\% & 1.63x & 10.72x \\
 
 \section{真实 CPU-GPU expert offload 微基准}
 \subsection{小容量与中容量场景}
-首先在两个代表性设置上比较 \texttt{demand}、\texttt{predictor} 和 \texttt{oracle} 三种策略。其中 \texttt{cap96\_g12\_t64} 表示 GPU cache 容量为 96、采样 12 个路由组、每组最多 64 个 token；\texttt{cap160\_g20\_t64} 表示容量为 160、采样 20 个路由组、每组最多 64 个 token。
+首先在两个代表性设置上比较 demand 基线、本文 predictor 方法和 oracle 上界。其中 \texttt{cap96\_g12\_t64} 表示 GPU cache 容量为 96、采样 12 个路由组、每组最多 64 个 token；\texttt{cap160\_g20\_t64} 表示容量为 160、采样 20 个路由组、每组最多 64 个 token。
 
 \begin{figure}[!htbp]
 \centering
@@ -139,34 +139,25 @@ setting & demand\_s & predictor\_s & predictor speedup & oracle speedup \\
 
 从图~\ref{fig:fig5-capacity} 和表~\ref{tab:lookahead3-capacity} 可以看出，cap128 与 cap160 下缓存仍然偏紧，predictor 反而低于 demand；当容量增加到 cap512 时，predictor 开始出现 1.08x 的正收益。在 \texttt{max\_tokens\_per\_group=64} 的配置下，当前层加未来三层窗口平均需要约 329 个层-专家 key，因此 cap128 和 cap160 明显偏紧，预取结果会与当前工作集互相挤压。该结果说明，三层提前必须和缓存容量、预取预算共同设计，不能简单地把所有未来三层预测结果都搬入 GPU。
 
-\section{调度策略对比与预算敏感性}
-\subsection{调度策略消融对比}
-在 GPU expert cache 容量为 128 的设置下，本文进一步比较三种调度配置：评分预取、工作集重排和最终采用的融合式缓存调度。三种配置都以 \texttt{demand} 为基线，并在相同 trace 和真实搬运微基准上重复运行。
-
-\begin{figure}[!htbp]
-\centering
-\includegraphics[width=0.95\textwidth]{fig5_2_scheduler_policy_compare}
-\caption{不同调度配置的真实 offload 调度对比}
-\label{fig:fig5-scheduler-compare}
-\end{figure}
+\section{最终调度配置与预算敏感性}
+\subsection{最终调度配置结果}
+在 GPU expert cache 容量为 128 的设置下，本文采用第四章所述的预测驱动受限预取调度。该配置以 \texttt{demand} 为基线，并在相同 trace 和真实搬运微基准上重复运行，平均结果如表~\ref{tab:scheduler-policy} 所示。
 
 \begin{table}[!htbp]
 \centering
 \small
-\begin{tabular}{lrrrrr}
+\begin{tabular}{rrrrrr}
 \hline
-mode & elapsed\_mean & speedup & sync\_mean & prefetch\_mean & transfer\_GB \\
+demand\_elapsed & ours\_elapsed & speedup & sync\_loads & prefetch\_loads & transfer\_GB \\
 \hline
-评分预取 & 1.990 & 2.536x & 1625 & 80 & 16.09 \\
-工作集重排 & 1.984 & 2.524x & 1620 & 92 & 16.16 \\
-融合式调度 & 1.983 & 2.528x & 1625 & 80 & 16.09 \\
+5.012 & 1.983 & 2.528x & 1625 & 80 & 16.09 \\
 \hline
 \end{tabular}
-\caption{三类调度策略的平均结果}
+\caption{最终调度配置在 cap128 下的平均结果}
 \label{tab:scheduler-policy}
 \end{table}
 
-三类配置的耗时都从 demand 约 5s 降到约 2s，说明主要瓶颈确实来自专家加载和缓存调度。这里的 speedup 是相对各自 demand 基线计算的，因此评分预取配置的相对加速比略高，而融合式调度的平均耗时最低；两者差异主要来自重复测量下 demand 基线的波动，而不是策略本身出现本质分化。工作集重排配置通过调整缓存驻留优先级获得接近的性能。这说明在当前 trace 上，稀疏预取和工作集重排都能发挥作用，而最终的融合式调度能够同时保留候选压缩和缓存重排两方面收益。
+可以看到，最终配置将平均耗时从 demand 的约 5.01s 降至 1.98s，获得 2.528x 加速。该结果说明主要瓶颈来自专家加载和缓存等待，而全局预测能够把一部分专家搬运提前到真实访问之前。与此同时，预取次数被控制在 80 次，说明本文方法并不是通过无差别扩大搬运量获得收益，而是通过置信度过滤、层距衰减和预算约束压缩候选集合。
 
 \subsection{预取预算敏感性}
 预取预算决定了每个调度窗口最多允许提前搬运多少个专家。预算过小会遗漏有价值的专家；预算过大则会将低置信度专家也搬入 GPU，导致传输量上升。
@@ -178,7 +169,7 @@ mode & elapsed\_mean & speedup & sync\_mean & prefetch\_mean & transfer\_GB \\
 \label{fig:fig5-budget}
 \end{figure}
 
-图~\ref{fig:fig5-budget} 显示，在 cap128 下，低预算区间的收益最好；随着预算从 4 逐步增加到 24，三种策略的加速比均呈下降趋势，而传输量持续上升。这说明预测结果不能被无差别使用，必须经过置信度过滤、层距衰减和每层 key 限制。本文最终采用“低预算 + 置信度阈值 + 层距衰减 + 每层 key 限制”的组合策略。
+图~\ref{fig:fig5-budget} 显示，在 cap128 下，低预算区间的收益最好；随着预算从 4 逐步增加到 24，加速比呈下降趋势，而传输量持续上升。这说明预测结果不能被无差别使用，必须经过置信度过滤、层距衰减和每层 key 限制。本文最终采用“低预算 + 置信度阈值 + 层距衰减 + 每层 key 限制”的组合配置。
 
 \section{结果讨论}
 综合实验可以得到以下结论。
@@ -189,7 +180,7 @@ mode & elapsed\_mean & speedup & sync\_mean & prefetch\_mean & transfer\_GB \\
 
 再次，预测收益依赖于容量与预算的匹配。容量太小会导致预取专家挤占当前工作集，容量太大则会让问题退化为近似常驻，降低调度研究意义。真正有价值的是在容量有限但仍能覆盖部分未来工作集的区间内，把有限显存留给最可能被访问的专家。
 
-最后，调度策略需要谨慎利用预测结果。实验中最有效的不是扩大预取集合，而是压缩候选集合：保留高置信度、近层、margin 足够大的专家，并通过融合式缓存调度避免缓存被低价值专家污染。
+最后，专家调度需要谨慎利用预测结果。实验中最有效的不是扩大预取集合，而是压缩候选集合：保留高置信度、近层、margin 足够大的专家，并通过保护当前访问专家和限制每层预取数量避免缓存被低价值专家污染。
 
 \section{本章小结}
 本章对第三章的 Visual Encoder 优化和第四章的专家提前调度进行了实验评估。视觉侧实验表明，SAT-ToMe 在保持任务效果基本稳定的同时，将 Visual Encoder 可见耗时降至 baseline 的 9.3\% 左右，并使整体 TTFT 获得约 1.63x 加速。专家侧实验表明，全局预测器能够达到 0.72 左右的 mean recall；在真实搬运场景下，predictor 与 oracle 都能显著降低同步等待并带来加速；调度预算和缓存容量则决定了预测收益能否真正落地。

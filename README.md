@@ -7,7 +7,7 @@
 - 基于真实 VL-MoE 推理链路的负载特征分析；
 - 面向 Visual Encoder 的语义感知视觉 Token 压缩与异步流水优化；
 - 面向 CPU-GPU expert offload 场景的全局路由预测器；
-- 基于预测结果的融合式 expert cache 调度策略；
+- 基于预测结果的 expert cache 受限预取调度策略；
 - 任务效果保持性、TTFT、预测准确率和真实 expert offload 微基准实验。
 
 ## 仓库结构
