@@ -10,6 +10,7 @@
 \usepackage{shuthesis}
 \usepackage{gbt7714}
 \usepackage{fvextra}
+\usepackage{xurl}
 \bibliographystyle{gbt7714-numerical}
 \citestyle{super}                   % 默认引用为角标格式，正文格式为\citestyle{numbers}
 
@@ -76,6 +77,11 @@
     ItalicFont=Times New Roman Italic,
     BoldItalicFont=Times New Roman Bold Italic
 ]{Times New Roman}
+
+% 长英文标识符和代码路径容易造成中文两端对齐被过度拉伸。
+% 这里不改变字体，仅增加断行弹性，并允许 \path 中的下划线等位置断行。
+\Urlmuskip=0mu plus 1mu
+\emergencystretch=2em
 
 
 % 下面是论文相关信息的填写：

@@ -103,7 +103,7 @@ Recall & 0.7158 & 0.7453 & 0.7042 \\
 \begin{equation}
 s(e,h) = \alpha_h \cdot p(e,h) \cdot \max(p_1-p_2,0),
 \end{equation}
-其中 $p(e,h)$ 是预测概率，$p_1$ 与 $p_2$ 分别为 top-1 和 top-2 预测概率，$\alpha_h$ 是层距衰减项。随后系统按分数从高到低保留有限数量的候选专家，并由 \texttt{select\_weighted\_global\_prefetch\_plan()} 将其转换为可执行的预取列表。
+其中 $p(e,h)$ 是预测概率，$p_1$ 与 $p_2$ 分别为 top-1 和 top-2 预测概率，$\alpha_h$ 是层距衰减项。随后系统按分数从高到低保留有限数量的候选专家，并由 \path{select_weighted_global_prefetch_plan()} 将其转换为可执行的预取列表。
 
 这一设计的核心思想是：不是“看见预测就搬运”，而是“只有高置信、近未来、收益大于成本的专家才进入缓存”。因此，预算、置信度阈值、最小 margin 和每层 key 上限共同决定最终的预取行为。
 
@@ -128,9 +128,9 @@ s(e,h) = \alpha_h \cdot p(e,h) \cdot \max(p_1-p_2,0),
 \section{系统实现与复杂度分析}
 整个原型实现拆分为三个阶段：
 \begin{enumerate}
-    \item 数据采集与构建：\texttt{collect\_qwen3vl\_global\_scratch\_data.py}、\texttt{build\_qwen3vl\_global\_scratch\_parquet.py}；
-    \item 预测器训练：\texttt{train\_qwen3vl\_global\_predictor.py}；
-    \item 在线集成：\texttt{qwen3vl\_global.py}、\texttt{global\_scheduling.py}、\texttt{run\_qwen3vl\_real\_offload\_benchmark.py} 与 \texttt{run\_qwen3vl\_end\_to\_end\_offload.py}。
+    \item 数据采集与构建：\path{collect_qwen3vl_global_scratch_data.py}、\path{build_qwen3vl_global_scratch_parquet.py}；
+    \item 预测器训练：\path{train_qwen3vl_global_predictor.py}；
+    \item 在线集成：\path{qwen3vl_global.py}、\path{global_scheduling.py}、\path{run_qwen3vl_real_offload_benchmark.py} 与 \path{run_qwen3vl_end_to_end_offload.py}。
 \end{enumerate}
 
 从复杂度上看，预测器的主要代价来自 MLP 前向和多层输出头，但其输入维度和参数规模都远小于 MoE 专家权重搬运成本，因此适合作为调度前置模块。调度器本身的复杂度主要来自候选专家排序和缓存替换，均低于专家前向与权重传输。若将 token 数、预测视野和候选专家数分别记为 $B$、$H$ 与 $K$，则预测与筛选的开销可近似写为
