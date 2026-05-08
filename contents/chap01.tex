@@ -23,26 +23,12 @@
 
 基于上述背景，围绕 VL-MoE 的推理负载均衡与加速开展研究，具有明确的理论意义和工程价值。在理论层面，通过对视觉 Token、文本 Token 以及专家路由行为进行系统化分析，可以揭示多模态稀疏模型的负载特征和跨层可预测性规律，为后续优化方法提供依据。在工程层面，通过分别从 Visual Encoder 和 MoE 调度两个关键环节入手，有望在保证模型效果稳定的前提下有效降低 TTFT、提升系统吞吐并缓解显存压力，进而提高多模态大模型在在线服务和资源受限部署场景中的实用性。
 
-本文的研究思路并不是将优化工作割裂为多个局部技巧，而是围绕完整推理链路开展协同设计：首先通过 profiling 分析识别负载瓶颈，再针对视觉侧高耗时问题设计多模态感知的 Encoder 优化方法，最后结合专家激活的跨层相关性构建基于可预测性的提前调度机制。本文的总体技术路线如图~\ref{fig:technical-roadmap} 所示。
+本文的研究思路并不是将优化工作割裂为多个局部技巧，而是围绕完整推理链路开展协同设计：首先通过 profiling 分析识别负载瓶颈，再针对视觉侧高耗时问题设计多模态感知的 Encoder 优化方法，最后结合专家激活的跨层相关性构建基于可预测性的提前调度机制。本文的整体研究框架如图~\ref{fig:technical-roadmap} 所示。
 
 \begin{figure}[!htbp]
 \centering
-\setlength{\fboxsep}{7pt}
-\renewcommand{\arraystretch}{1.2}
-\begin{tabular}{c}
-\fbox{\parbox{0.82\textwidth}{\centering\textbf{负载特征分析与问题建模}\\
-围绕多模态输入负载、Visual Encoder 开销、专家分布均衡性与跨层路由相关性展开 profiling，定位系统瓶颈并明确优化目标。}}\\[6pt]
-$\Downarrow$\\[6pt]
-\fbox{\parbox{0.82\textwidth}{\centering\textbf{面向 Visual Encoder 的多模态感知优化}\\
-通过视觉 Token 压缩与异步流水执行，降低视觉前端计算开销并减少首字延迟。}}\\[6pt]
-$\Downarrow$\\[6pt]
-\fbox{\parbox{0.82\textwidth}{\centering\textbf{基于可预测性的专家提前调度}\\
-利用跨层专家激活相关性构建轻量级预测器，结合预取、缓存与差异化调度策略降低专家访问与通信开销。}}\\[6pt]
-$\Downarrow$\\[6pt]
-\fbox{\parbox{0.82\textwidth}{\centering\textbf{系统实现与综合评估}\\
-在公开数据集与典型部署场景中，从时延、吞吐、显存、缓存命中率和精度保持等维度评估优化效果。}}
-\end{tabular}
-\caption{本文的总体技术路线}
+\includegraphics[width=\textwidth]{fig1_overall_framework}
+\caption{本文整体研究框架}
 \label{fig:technical-roadmap}
 \end{figure}
 
