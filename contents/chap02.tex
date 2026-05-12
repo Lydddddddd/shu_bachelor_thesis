@@ -70,7 +70,7 @@ VL-MoE 的推理过程并不是单一的语言生成过程，而是由视觉编�
 \label{fig:token-distribution}
 \end{figure}
 
-由图~\ref{fig:token-distribution} 可以看出，多模态请求中的图像 Token 占据绝对主导地位。
+由图~\ref{fig:token-distribution} 可以看出，多模态请求中的图像 Token 占据绝对主导地位。其中，图~\ref{fig:mmbench-token} 和图~\ref{fig:mme-token} 分别给出了 MMBench 与 MME 数据集上的 Token 分布。
 在 MMBench 数据集上，图像 Token 占比达到 95.08\%，文本 Token 仅占 4.92\%；在 MME 数据集上，图像 Token 占比进一步上升至 98.15\%，文本 Token 仅占 1.85\%。
 这说明，对于典型多模态推理场景而言，系统前端的大部分计算负载首先来自视觉侧而不是语言侧。
 
@@ -153,6 +153,7 @@ VL-MoE 的推理过程并不是单一的语言生成过程，而是由视觉编�
 
 结合前文对 Visual Encoder 的分析可以看到，VL-MoE 推理瓶颈并不是单点问题，而是由前端视觉开销和后端专家调度共同构成的复合问题。
 前者决定了首字延迟的基线水平，后者决定了稀疏结构在真实部署中的可兑现效率。因此，后续优化设计必须同时覆盖这两个方向。
+表~\ref{tab:bottleneck-summary} 对上述主要瓶颈与现象进行了汇总。
 
 \begin{table}[!htbp]
 \centering

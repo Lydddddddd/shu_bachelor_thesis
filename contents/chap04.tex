@@ -8,6 +8,7 @@
 围绕这一问题，本文将其定义为面向 offload 场景的\textbf{专家提前调度问题}：利用当前层 Router 已经产生的路由信号，预测未来若干层更可能激活的专家集合，并在真实访问发生前完成预取、驻留和替换决策，从而把一部分等待时间前移到当前层的计算窗口中。现有系统工作已经从 KV cache、prefill/decoding 解耦以及 expert offloading 等角度探索过 serving 优化\cite{kwon2023pagedattention,zhong2024distserve,xue2024moeinfinity,he2024expertflow,zhu2026dali}。本文进一步利用\textbf{路由可预测性}，把优化对象从“被动处理专家访问”推进到“主动规划专家访问”。
 
 与纯文本 MoE 相比，Qwen3-VL 这类多模态模型还具有额外的条件变量。图像 Token 与文本 Token 的路由密度、位置分布和上下文稳定性并不相同，因此本文在预测器输入和调度器决策中都显式引入模态信息，而不是把它当成后处理噪声。
+面向 offload 场景的全局预测与专家调度整体框架如图~\ref{fig:fig4-offload-arch} 所示。
 
 \begin{figure}[!htbp]
 \centering
@@ -32,6 +33,7 @@
 \end{enumerate}
 
 在当前实验中，fresh 数据集共包含 8347 个 token，其中训练集 7268 个 token，验证集 1079 个 token；按模态统计，图像 token 为 6734，文本 token 为 1613。数据集覆盖了多项选择、描述、推理和图文组合等样本，因此能够提供较丰富的路由模式。
+fresh 路由数据的采集与转换流程如图~\ref{fig:fig4-data-pipeline} 所示，训练数据规模和模态分布统计如图~\ref{fig:fig4-dataset} 所示。
 
 \begin{figure}[!htbp]
 \centering
@@ -43,7 +45,7 @@
 \begin{figure}[!htbp]
 \centering
 \includegraphics[width=0.95\textwidth]{fig4_3_dataset_stats}
-\caption{训练数据规模、模态分布与案例分布统计}
+\caption{训练数据规模与模态分布统计}
 \label{fig:fig4-dataset}
 \end{figure}
 
@@ -68,7 +70,7 @@
 其中 $\rho(\cdot)$ 表示由 router 概率与 Top-$k$ one-hot 计算得到的统计特征映射。
 
 \subsection{网络结构}
-预测器采用“共享骨干 + 多层输出头”的轻量结构。首先将路由信号和 token 信号投影到同一隐空间，再经过多层 MLP backbone 提取稳定特征，最后为每一层设置独立输出头，直接输出该层的专家 logits。对应到实现，核心模块位于原型系统的 \texttt{qwen3vl\_global.py}。其中 \texttt{route\_proj} 负责处理 router 概率和 Top-$k$ one-hot，\texttt{token\_proj} 负责处理 token 位置，\texttt{use\_extra\_features} 打开后再接入 input id、模态和 route statistics。
+预测器采用“共享骨干 + 多层输出头”的轻量结构。首先将路由信号和 token 信号投影到同一隐空间，再经过多层 MLP backbone 提取稳定特征，最后为每一层设置独立输出头，直接输出该层的专家 logits。对应到实现，核心模块位于原型系统的 \texttt{qwen3vl\_global.py}。其中 \texttt{route\_proj} 负责处理 router 概率和 Top-$k$ one-hot，\texttt{token\_proj} 负责处理 token 位置，\texttt{use\_extra\_features} 打开后再接入 input id、模态和 route statistics。训练过程中 recall 与 loss 的变化如图~\ref{fig:fig4-train-curve} 所示。
 
 \begin{figure}[!htbp]
 \centering
@@ -82,7 +84,7 @@
 \begin{equation}
 \mathcal{L}_{\mathrm{pred}} = \sum_{h=1}^{H} \omega_h \cdot \mathrm{BCEWithLogits}\big(\hat{\mathbf{z}}^{(h)}, \mathbf{y}^{(h)}\big),
 \end{equation}
-其中 $\omega_h$ 为不同预测视野的权重。训练完成后，模型在验证集上的 best mean recall 达到 0.7219，early/mid/late 三个视野的 recall 也都稳定在较高水平，说明 layer-0 条件化预测已经具备进入运行时调度链路的基础。
+其中 $\omega_h$ 为不同预测视野的权重。训练完成后，模型在验证集上的 best mean recall 达到 0.7219，early/mid/late 三个视野的 recall 也都稳定在较高水平，具体结果见表~\ref{tab:global-recall}。这说明 layer-0 条件化预测已经具备进入运行时调度链路的基础。
 
 \begin{table}[!htbp]
 \centering
@@ -98,23 +100,20 @@ Recall & 0.7158 & 0.7453 & 0.7042 \\
 \end{table}
 
 \section{预测驱动的专家预取与缓存调度}
-\subsection{加权预取策略}
-系统并不把所有预测结果无差别搬入 GPU，而是根据置信度、层距和预算进行筛选。对于未来第 $h$ 层的候选专家 $e$，调度分数可写成
+\subsection{预测驱动的受限预取调度策略}
+全局预测器会给出后续多层可能访问的专家集合，但这些预测结果不能被直接等价为搬运指令。一方面，预测本身存在误差，低置信度候选专家如果被提前搬入 GPU，可能只会增加无效传输；另一方面，GPU expert cache 容量有限，过多预取还可能挤出当前层真实计算需要的专家。因此，本文采用预测驱动的受限预取调度策略，将预测结果先压缩为少量高价值候选，再在不破坏当前工作集的前提下执行预取。
+
+具体而言，调度器首先根据全局预测结果形成未来若干层的候选专家集合，并从置信度、层距和预测区分度三个角度为候选专家打分。对于未来第 $h$ 层的候选专家 $e$，调度分数定义为
 \begin{equation}
 s(e,h) = \alpha_h \cdot p(e,h) \cdot \max(p_1-p_2,0),
 \end{equation}
-其中 $p(e,h)$ 是预测概率，$p_1$ 与 $p_2$ 分别为 top-1 和 top-2 预测概率，$\alpha_h$ 是层距衰减项。随后系统按分数从高到低保留有限数量的候选专家，并由 \path{select_weighted_global_prefetch_plan()} 将其转换为可执行的预取列表。
+其中 $p(e,h)$ 表示专家 $e$ 在未来第 $h$ 层被访问的预测概率，$p_1$ 与 $p_2$ 分别表示该预测分布中的 top-1 和 top-2 概率，$\alpha_h$ 为层距衰减项。该分数同时体现三层含义：预测概率越高，候选专家越值得预取；距离当前层越近，预取命中的时间价值越高；top-1 与 top-2 的 margin 越大，说明预测越明确，误预取风险越低。
 
-这一设计的核心思想是：不是“看见预测就搬运”，而是“只有高置信、近未来、收益大于成本的专家才进入缓存”。因此，预算、置信度阈值、最小 margin 和每层 key 上限共同决定最终的预取行为。
+在得到候选分数后，系统继续执行三类约束。第一，通过置信度阈值和最小 margin 过滤掉不稳定预测，避免低价值专家进入预取队列。第二，通过每层 key 上限和全局预取预算限制搬运规模，使额外传输量保持可控。第三，将当前层正在访问的真实专家作为保护集合，在缓存替换时禁止预取候选挤出当前计算必需的专家。
 
-\subsection{最终采用的专家调度策略}
-在上述加权预取策略基础上，本文最终采用一种\textbf{预测驱动的受限预取调度策略}。该策略的目标不是最大化预取数量，而是在有限 GPU expert cache 中优先保留最可能在近未来被访问的专家。
+最终，\path{select_weighted_global_prefetch_plan()} 会按照综合分数从高到低生成有限长度的预取列表。若候选专家已经驻留在 GPU cache 中，系统只更新其缓存分数；若候选专家尚未驻留，则在预算允许且不破坏保护集合的条件下提前搬入 GPU。由此，专家搬运不再等到真实访问发生后才被动触发，而是被提前安排到当前层计算窗口附近执行，从而把部分同步等待转化为可重叠的后台搬运。
 
-具体而言，调度器首先根据全局预测结果形成未来若干层的候选专家集合，并对候选专家进行置信度过滤、层距衰减和 margin 过滤；随后，系统按照综合分数从高到低选择有限数量的专家进入预取队列，并把当前层正在访问的真实专家作为保护集合，避免预取操作挤出正在计算所需的专家。
-
-在执行预取时，调度器只搬运筛选后的高价值候选专家。若预测专家已经驻留在 GPU cache 中，系统仅更新其缓存分数；若专家尚未驻留，则在预算允许且不会破坏当前保护集合的条件下提前搬入 GPU。这样，缓存既能提前吸收未来高概率专家，又能避免低置信度预测造成无效搬运。
-
-该策略可以概括为“先筛选、再预取、保当前、限预算”：先通过置信度、margin 和层距衰减压缩候选集合，再按加权分数执行有限预取，同时保护当前层真实访问专家，并通过每层 key 上限和全局预算限制额外传输量。实验部分将表明，该配置在缓存容量为 128 的真实搬运微基准上取得了最稳定的收益。
+因此，该策略的核心可以概括为“预测候选、筛选高值、保护当前、限量预取”。它并不追求搬运尽可能多的专家，而是在有限 GPU expert cache 中优先保留最可能在近未来被访问、且最可能带来等待时间下降的专家。第五章实验将表明，在合适的缓存容量和预取预算下，该受限预取策略能够显著降低真实 CPU-GPU expert offload 场景中的同步加载开销。
 
 \subsection{预测错误与回退机制}
 预测驱动的调度不可避免会出现误预测，因此系统需要在正确性与收益之间做折中。本文采用两级回退机制：

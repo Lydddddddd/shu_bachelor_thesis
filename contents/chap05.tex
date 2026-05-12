@@ -79,7 +79,7 @@ SAT-ToMe + Pipeline & 25512 & 800 & 3.1\% & 1.63x & 10.72x \\
 
 \section{真实 CPU-GPU expert offload 微基准}
 \subsection{小容量与中容量场景}
-首先在两个代表性设置上比较 demand 基线、本文 predictor 方法和 oracle 上界。其中 \texttt{cap96\_g12\_t64} 表示 GPU cache 容量为 96、采样 12 个路由组、每组最多 64 个 token；\texttt{cap160\_g20\_t64} 表示容量为 160、采样 20 个路由组、每组最多 64 个 token。
+首先在两个代表性设置上比较 demand 基线、本文 predictor 方法和 oracle 上界。其中 \texttt{cap96\_g12\_t64} 表示 GPU cache 容量为 96、采样 12 个路由组、每组最多 64 个 token；\texttt{cap160\_g20\_t64} 表示容量为 160、采样 20 个路由组、每组最多 64 个 token。三种策略的整体对比如图~\ref{fig:fig5-real-compare} 所示，具体数值见表~\ref{tab:real-offload-result}。
 
 \begin{figure}[!htbp]
 \centering
