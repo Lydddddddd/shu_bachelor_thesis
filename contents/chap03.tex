@@ -165,7 +165,7 @@ X_{\mathrm{red}} = [\tilde{v}_1, \tilde{v}_2, \ldots, \tilde{v}_K] \in \mathbb{R
 \subsection{主流与视觉流的异步重叠}
 本文使用 \texttt{torch.cuda.Stream} 为视觉侧构建独立的 \texttt{vision\_stream}，使其与默认 \texttt{main\_stream} 并发执行。
 具体而言，主流主要负责文本嵌入计算、后续多模态主干准备以及最终 LLM 推理，视觉流则负责视觉预处理、Stage 1 编码、SAT-ToMe 压缩和 Stage 2 编码。
-在工程实现上，原始 \texttt{forward} 被拆分为 \texttt{\_prepare\_vision\_inputs}、\texttt{forward\_stage1}、\texttt{excute\_semantic\_merge} 和 \texttt{forward\_stage2} 四个阶段，便于在视觉流与主流之间显式插入 overlap 点和同步点。
+在工程实现上，原始 \texttt{forward} 被拆分为 \texttt{\_prepare\_vision\_inputs}、\texttt{forward\_stage1}、\texttt{execute\_semantic\_merge} 和 \texttt{forward\_stage2} 四个阶段，便于在视觉流与主流之间显式插入 overlap 点和同步点。
 
 在时间轴上，系统执行过程可以概括为以下步骤：
 \begin{enumerate}

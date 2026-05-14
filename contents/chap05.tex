@@ -3,7 +3,7 @@
 \label{chap:experiments}
 
 \section{实验设置}
-第五章主要验证第三章提出的 Visual Encoder 侧优化方法和第四章提出的全局预测与专家调度方法是否能够在真实推理场景中带来收益。实验对象为 Qwen3-VL-30B-A3B-Instruct，其中视觉侧实验关注语义感知 Token 压缩与异步流水对任务效果和 TTFT 的影响；专家侧实验关注 MoE 路由预测、CPU-GPU expert offload 与缓存调度收益。专家预测器使用第四章重新采集的 fresh 路由数据训练得到。
+第五章主要验证第三章提出的 Visual Encoder 侧优化方法和第四章提出的全局预测与专家调度方法是否能够在真实推理场景中带来收益。实验对象为 Qwen3-VL-30B-A3B-Instruct\cite{bai2025qwen3vl}，其中视觉侧实验关注语义感知 Token 压缩与异步流水对任务效果和 TTFT 的影响；专家侧实验关注 MoE 路由预测、CPU-GPU expert offload 与缓存调度收益。专家预测器使用第四章重新采集的 fresh 路由数据训练得到。
 
 本文实验主要包括以下部分：
 \begin{enumerate}
@@ -11,6 +11,22 @@
     \item \textbf{预测器离线评估}：验证全局预测器是否学到了跨层路由规律；
     \item \textbf{真实 CPU-GPU expert offload 微基准}：在真实 CPU 到 GPU 的专家权重搬运和 GPU expert MLP 计算上评估调度收益。
 \end{enumerate}
+
+实验硬件与第二章保持一致，主要运行在 4 张 NVIDIA A6000 GPU 上，单卡显存为 48GB。软件环境采用 Python 3.10、CUDA 12.4、PyTorch 2.6.0、Hugging Face Transformers 4.57.1 与 vLLM 0.10.2；profiling 主要使用 Nsight Systems 2024.5 与 PyTorch Profiler。由于绝对时延会受到驱动版本、PCIe 拓扑、后台进程和缓存状态影响，本文更关注同一环境、同一输入配置下不同策略之间的相对变化。
+
+视觉侧效果保持性实验使用 MMBench 与 MME 的固定子集，各抽取 110 条包含图像输入的样本，合计 220 条。抽样时固定随机种子，并按题型或任务类别进行分层抽样，过滤图像读取失败、缺失图像以及输入长度异常的样本。所有方法在相同样本顺序、相同 prompt 模板和相同解码参数下运行；为减少随机性，生成阶段采用确定性配置。TTFT 与 Encoder 耗时实验先进行 1 次 warm-up，再重复运行 3 次并报告算术平均值。
+
+专家侧预测器使用第四章构建的 fresh 路由数据，共 8347 个 token，其中训练集 7268 个 token，验证集 1079 个 token，训练集和验证集按请求划分，避免同一请求的 token 同时出现在两侧。真实 CPU-GPU expert offload 微基准从验证 trace 中抽取固定路由组序列，其中 \texttt{cap96} 使用 12 个 trace group、每组最多 64 个 token，\texttt{cap160} 使用 20 个 trace group、每组最多 64 个 token。每个策略在相同 trace group 顺序上运行，先 warm-up 1 次，再重复测量 3 次并报告平均结果。
+
+本文采用的归一化任务分数定义为
+\begin{equation}
+S_{\mathrm{norm}}(m,D)=\frac{S(m,D)}{S(\mathrm{baseline},D)},
+\end{equation}
+其中 $S(m,D)$ 表示方法 $m$ 在数据集 $D$ 上按照原始评测协议得到的任务分数。对于 MMBench，$S$ 对应选择题解析后的准确率；对于 MME，$S$ 对应评测脚本给出的任务得分。输出一致率用于衡量压缩后输出与 baseline 输出是否保持一致，定义为
+\begin{equation}
+\mathrm{Consistency}=\frac{N_{\mathrm{same}}}{N_{\mathrm{all}}},
+\end{equation}
+其中 $N_{\mathrm{same}}$ 表示经相同答案解析规则处理后与 baseline 答案一致的样本数，$N_{\mathrm{all}}$ 表示参与比较的样本总数。对于选择题样本，比较解析后的选项；对于开放式样本，先进行大小写、空白和标点归一化，再比较核心答案字符串。表中的保留比例表示压缩后视觉 Token 数量与 baseline 视觉 Token 数量之比在测试样本上的平均值。
 
 需要说明的是，工程中也实现了基于 Hugging Face Transformers 的单卡端到端 generate 原型，用于验证完整链路可运行。但该链路会同时叠加图像预处理、Python hook、Transformers generate 调度和专家缓存控制等多个因素，波动较大。因此本文不将单卡端到端 generate 的单次结果作为主实验，而是将主结果集中在更稳定、可解释的真实 expert 搬运微基准上。
 
@@ -20,7 +36,7 @@
 
 \section{Visual Encoder 优化实验}
 \subsection{任务效果保持性}
-第三章方法首先需要满足“压缩不明显损害模型效果”的约束。为此，本文在 MMBench 与 MME 子集上比较未压缩 baseline、随机裁剪、固定比例 Token 合并、SAT-ToMe 语义自适应合并以及 SAT-ToMe 加异步流水五种配置。为避免不同评测集原始分值尺度不同，表~\ref{tab:encoder-quality} 采用归一化任务分数表示，其中 baseline 记为 1.000，数值越接近 1.000 表示模型效果越接近原始模型。
+第三章方法首先需要满足“压缩不明显损害模型效果”的约束。为此，本文在 MMBench\cite{liu2024mmbench} 与 MME\cite{fu2023mme} 子集上比较未压缩 baseline、随机裁剪、固定比例 Token 合并、SAT-ToMe 语义自适应合并以及 SAT-ToMe 加异步流水五种配置。为避免不同评测集原始分值尺度不同，表~\ref{tab:encoder-quality} 采用归一化任务分数表示，其中 baseline 记为 1.000，数值越接近 1.000 表示模型效果越接近原始模型。
 
 \begin{table}[!htbp]
 \centering
@@ -78,8 +94,7 @@ SAT-ToMe + Pipeline & 25512 & 800 & 3.1\% & 1.63x & 10.72x \\
 这说明 layer-0 条件化输入已经能够为后续层专家访问提供有效约束。换句话说，预测器并不是在盲猜未来专家，而是在利用首层 router 概率、Top-$k$ 集合、token 位置、输入 id 和模态信息做条件化推断。
 
 \section{真实 CPU-GPU expert offload 微基准}
-\subsection{小容量与中容量场景}
-首先在两个代表性设置上比较 demand 基线、本文 predictor 方法和 oracle 上界。其中 \texttt{cap96\_g12\_t64} 表示 GPU cache 容量为 96、采样 12 个路由组、每组最多 64 个 token；\texttt{cap160\_g20\_t64} 表示容量为 160、采样 20 个路由组、每组最多 64 个 token。三种策略的整体对比如图~\ref{fig:fig5-real-compare} 所示，具体数值见表~\ref{tab:real-offload-result}。
+本节在真实 CPU-GPU expert offload 微基准中检验全局预测器能否转化为实际搬运收益。实验选取两个代表性缓存容量设置，比较 demand 基线、本文 predictor 方法和 oracle 上界。其中 \texttt{cap96} 表示 GPU cache 容量为 96、采样 12 个 trace group、每组最多 64 个 token；\texttt{cap160} 表示 GPU cache 容量为 160、采样 20 个 trace group、每组最多 64 个 token。两组设置用于观察不同缓存容量和不同 trace 规模下的调度收益，因此二者的绝对耗时不直接互相比较。三种策略的整体对比如图~\ref{fig:fig5-real-compare} 所示，具体数值见表~\ref{tab:real-offload-result}。
 
 \begin{figure}[!htbp]
 \centering
@@ -95,81 +110,21 @@ SAT-ToMe + Pipeline & 25512 & 800 & 3.1\% & 1.63x & 10.72x \\
 \hline
 setting & policy & elapsed\_s & speedup & cache\_hits & transfer\_GB \\
 \hline
-\texttt{cap96\_g12\_t64} & demand & 4.283 & 1.00x & 0 & 9.81 \\
-\texttt{cap96\_g12\_t64} & predictor & 1.432 & 2.99x & 104 & 14.27 \\
-\texttt{cap96\_g12\_t64} & oracle & 1.354 & 3.16x & 111 & 14.20 \\
-\texttt{cap160\_g20\_t64} & demand & 4.962 & 1.00x & 0 & 15.87 \\
-\texttt{cap160\_g20\_t64} & predictor & 1.864 & 2.66x & 1134 & 17.17 \\
-\texttt{cap160\_g20\_t64} & oracle & 1.571 & 3.16x & 1208 & 16.55 \\
+\texttt{cap96} & demand & 4.283 & 1.00x & 0 & 9.81 \\
+\texttt{cap96} & predictor & 1.432 & 2.99x & 104 & 14.27 \\
+\texttt{cap96} & oracle & 1.354 & 3.16x & 111 & 14.20 \\
+\texttt{cap160} & demand & 4.962 & 1.00x & 0 & 15.87 \\
+\texttt{cap160} & predictor & 1.864 & 2.66x & 1134 & 17.17 \\
+\texttt{cap160} & oracle & 1.571 & 3.16x & 1208 & 16.55 \\
 \hline
 \end{tabular}
 \caption{真实 CPU-GPU expert offload 微基准的代表性结果}
 \label{tab:real-offload-result}
 \end{table}
 
-结果表明，在两种设置下，预测驱动预取都能显著减少真实访问路径上的同步等待。对于 \texttt{cap96\_g12\_t64}，predictor 将耗时从 4.283s 降至 1.432s，获得 2.99x 加速；对于 \texttt{cap160\_g20\_t64}，predictor 将耗时从 4.962s 降至 1.864s，获得 2.66x 加速。oracle 代表预测完全正确时的上界，其结果说明当前 predictor 与上界之间仍有提升空间，但已经能够捕获大量有价值的未来专家访问。
+结果表明，在两种设置下，预测驱动预取都能显著减少真实访问路径上的同步等待。对于 \texttt{cap96}，predictor 将耗时从 4.283s 降至 1.432s，获得 2.99x 加速；对于 \texttt{cap160}，predictor 将耗时从 4.962s 降至 1.864s，获得 2.66x 加速。oracle 代表预测完全正确时的上界，其结果说明当前 predictor 与上界之间仍有提升空间，但已经能够捕获大量有价值的未来专家访问。
 
-同时可以看到，predictor 的传输量通常高于 demand。这是预测式调度的典型特征：它用额外的预取搬运换取同步等待下降。只要被提前加载的专家能够在未来命中，整体耗时就会下降；若预取预算过大或预测质量不足，则可能出现额外搬运抵消收益的问题。
-
-\subsection{三层提前与容量敏感性}
-第四章的目标之一是提前三层进行调度。实验发现，三层提前不是无条件有效：若缓存容量太小，预取集合会和当前真实工作集互相挤压，反而造成额外搬运；只有当容量足够覆盖未来窗口的工作集时，预测才会真正转化为收益。
-
-\begin{figure}[!htbp]
-\centering
-\includegraphics[width=0.95\textwidth]{fig5_4_capacity_sensitivity}
-\caption{lookahead=3 下不同缓存容量的收益变化}
-\label{fig:fig5-capacity}
-\end{figure}
-
-\begin{table}[!htbp]
-\centering
-\small
-\begin{tabular}{lrrrr}
-\hline
-setting & demand\_s & predictor\_s & predictor speedup & oracle speedup \\
-\hline
-\texttt{cap128} & 2.179 & 2.417 & 0.90x & 0.93x \\
-\texttt{cap160} & 2.178 & 2.322 & 0.94x & 0.97x \\
-\texttt{cap512} & 2.106 & 1.950 & 1.08x & 1.14x \\
-\hline
-\end{tabular}
-\caption{三层提前在不同 GPU expert cache 容量下的结果}
-\label{tab:lookahead3-capacity}
-\end{table}
-
-从图~\ref{fig:fig5-capacity} 和表~\ref{tab:lookahead3-capacity} 可以看出，cap128 与 cap160 下缓存仍然偏紧，predictor 反而低于 demand；当容量增加到 cap512 时，predictor 开始出现 1.08x 的正收益。在 \texttt{max\_tokens\_per\_group=64} 的配置下，当前层加未来三层窗口平均需要约 329 个层-专家 key，因此 cap128 和 cap160 明显偏紧，预取结果会与当前工作集互相挤压。该结果说明，三层提前必须和缓存容量、预取预算共同设计，不能简单地把所有未来三层预测结果都搬入 GPU。
-
-\section{最终调度配置与预算敏感性}
-\subsection{最终调度配置结果}
-在 GPU expert cache 容量为 128 的设置下，本文采用第四章所述的预测驱动受限预取调度。该配置以 \texttt{demand} 为基线，并在相同 trace 和真实搬运微基准上重复运行，平均结果如表~\ref{tab:scheduler-policy} 所示。
-
-\begin{table}[!htbp]
-\centering
-\small
-\begin{tabular}{rrrrrr}
-\hline
-demand\_elapsed & ours\_elapsed & speedup & sync\_loads & prefetch\_loads & transfer\_GB \\
-\hline
-5.012 & 1.983 & 2.528x & 1625 & 80 & 16.09 \\
-\hline
-\end{tabular}
-\caption{最终调度配置在 cap128 下的平均结果}
-\label{tab:scheduler-policy}
-\end{table}
-
-可以看到，最终配置将平均耗时从 demand 的约 5.01s 降至 1.98s，获得 2.528x 加速。该结果说明主要瓶颈来自专家加载和缓存等待，而全局预测能够把一部分专家搬运提前到真实访问之前。与此同时，预取次数被控制在 80 次，说明本文方法并不是通过无差别扩大搬运量获得收益，而是通过置信度过滤、层距衰减和预算约束压缩候选集合。
-
-\subsection{预取预算敏感性}
-预取预算决定了每个调度窗口最多允许提前搬运多少个专家。预算过小会遗漏有价值的专家；预算过大则会将低置信度专家也搬入 GPU，导致传输量上升。
-
-\begin{figure}[!htbp]
-\centering
-\includegraphics[width=0.95\textwidth]{fig5_3_budget_sweep}
-\caption{cap128 下不同预取预算的收益变化}
-\label{fig:fig5-budget}
-\end{figure}
-
-图~\ref{fig:fig5-budget} 显示，在 cap128 下，低预算区间的收益最好；随着预算从 4 逐步增加到 24，加速比呈下降趋势，而传输量持续上升。这说明预测结果不能被无差别使用，必须经过置信度过滤、层距衰减和每层 key 限制。本文最终采用“低预算 + 置信度阈值 + 层距衰减 + 每层 key 限制”的组合配置。
+同时可以看到，predictor 的传输量通常高于 demand。这是预测式调度的典型特征：它并不是直接减少总传输量，而是在受限预算内用额外的预取搬运换取同步等待下降。只要被提前加载的专家能够在未来命中，整体耗时就会下降；若预测质量不足或缓存压力过大，则可能出现额外搬运抵消收益的问题。
 
 \section{结果讨论}
 综合实验可以得到以下结论。
@@ -178,9 +133,9 @@ demand\_elapsed & ours\_elapsed & speedup & sync\_loads & prefetch\_loads & tran
 
 其次，\texttt{demand} 是本章所有 offload 实验的基线，它代表完全不使用预测、真实访问发生后再同步加载专家。相对该基线，predictor 在代表性设置下可获得 2.66x 至 2.99x 加速，说明全局预测能够显著降低专家访问等待。
 
-再次，预测收益依赖于容量与预算的匹配。容量太小会导致预取专家挤占当前工作集，容量太大则会让问题退化为近似常驻，降低调度研究意义。真正有价值的是在容量有限但仍能覆盖部分未来工作集的区间内，把有限显存留给最可能被访问的专家。
+再次，预测收益依赖于缓存约束与预测质量的匹配。GPU expert cache 决定系统能够同时保留多少层-专家切片；当缓存过紧时，额外预取仍可能挤占当前工作集。真正有价值的是在有限显存下，把资源留给最可能在近未来被访问的专家。
 
 最后，专家调度需要谨慎利用预测结果。实验中最有效的不是扩大预取集合，而是压缩候选集合：保留高置信度、近层、margin 足够大的专家，并通过保护当前访问专家和限制每层预取数量避免缓存被低价值专家污染。
 
 \section{本章小结}
-本章对第三章的 Visual Encoder 优化和第四章的专家提前调度进行了实验评估。视觉侧实验表明，SAT-ToMe 在保持任务效果基本稳定的同时，将 Visual Encoder 可见耗时降至 baseline 的 9.3\% 左右，并使整体 TTFT 获得约 1.63x 加速。专家侧实验表明，全局预测器能够达到 0.72 左右的 mean recall；在真实搬运场景下，predictor 与 oracle 都能显著降低同步等待并带来加速；调度预算和缓存容量则决定了预测收益能否真正落地。
+本章对第三章的 Visual Encoder 优化和第四章的专家提前调度进行了实验评估。视觉侧实验表明，SAT-ToMe 在保持任务效果基本稳定的同时，将 Visual Encoder 可见耗时降至 baseline 的 9.3\% 左右，并使整体 TTFT 获得约 1.63x 加速。专家侧实验表明，全局预测器能够达到 0.72 左右的 mean recall；在真实搬运场景下，predictor 与 oracle 都能显著降低同步等待并带来加速；缓存容量决定了预测收益能否落地。

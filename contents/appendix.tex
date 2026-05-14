@@ -19,14 +19,19 @@ class SAT_ToMe_Module(nn.Module):
         super().__init__()
         self.base_ratio = base_ratio
         self.text_proj = nn.Linear(text_dim, vis_dim)
-        self.text_proj.weight.is_uninitialized = True
-        self.text_proj.bias.is_uninitialized = True
+        nn.init.xavier_uniform_(self.text_proj.weight)
+        nn.init.zeros_(self.text_proj.bias)
 
     def forward(self, x_vis, text_feat):
         if text_feat is None:
             return x_vis, torch.arange(x_vis.shape[0], device=x_vis.device)
 
-        N, C = x_vis.shape
+        if text_feat.dim() > 2:
+            text_feat = text_feat.reshape(-1, text_feat.size(-1))
+        if text_feat.dim() == 2:
+            text_feat = text_feat.mean(dim=0, keepdim=True)
+
+        N, _ = x_vis.shape
         q_text = self.text_proj(text_feat.to(x_vis.dtype))
 
         norm_vis = F.normalize(x_vis, p=2, dim=-1)
@@ -38,7 +43,7 @@ class SAT_ToMe_Module(nn.Module):
         max_entropy = torch.log(torch.tensor(float(N), device=x_vis.device))
         adaptive_ratio = self.base_ratio * (1 - entropy / max_entropy)
 
-        k = max(16, int(N * (1 - adaptive_ratio.item())))
+        k = min(N, max(16, int(N * (1 - adaptive_ratio.item()))))
         _, topk_indices = torch.topk(scores, k)
         topk_indices, _ = torch.sort(topk_indices)
 
@@ -56,12 +61,15 @@ def _prepare_vision_inputs(self, x: torch.Tensor, grid_thw: torch.Tensor | list[
         grid_thw_list = grid_thw
         grid_thw = np.array(grid_thw, dtype=np.int32)
     else:
-        grid_thw_list = grid_thw.tolist()
-        grid_thw = grid_thw.numpy()
+        grid_thw_cpu = grid_thw.detach().cpu()
+        grid_thw_list = grid_thw_cpu.tolist()
+        grid_thw = grid_thw_cpu.numpy()
 
     pos_embeds = self.fast_pos_embed_interpolate(grid_thw_list)
     hidden_states = hidden_states + pos_embeds
     rotary_pos_emb_cos, rotary_pos_emb_sin = self.rot_pos_emb(grid_thw_list)
+    rotary_pos_emb_cos = rotary_pos_emb_cos.to(self.device, non_blocking=True)
+    rotary_pos_emb_sin = rotary_pos_emb_sin.to(self.device, non_blocking=True)
 
     cu_seqlens = np.repeat(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(
         axis=0, dtype=np.int32
@@ -89,7 +97,7 @@ def forward_stage1(self, hidden_states, cu_seqlens, rotary_pos_emb_cos, rotary_p
     return hidden_states
 
 
-def excute_semantic_merge(self, hidden_states, text_feat, rotary_pos_emb_cos, rotary_pos_emb_sin):
+def execute_semantic_merge(self, hidden_states, text_feat, rotary_pos_emb_cos, rotary_pos_emb_sin):
     vis_feat = hidden_states.squeeze(1) if hidden_states.dim() == 3 else hidden_states
     merged_feat, keep_indices = self.sat_tome(vis_feat, text_feat)
 
@@ -123,8 +131,8 @@ def forward_stage2(self, hidden_states, cu_seqlens, rotary_pos_emb_cos, rotary_p
 
     hidden_states = self.merger(hidden_states)
     hidden_states = torch.cat([hidden_states] + deepstack_feature_lists, dim=1)
-	    return hidden_states
-	\end{CodeBlock}
+    return hidden_states
+\end{CodeBlock}
 
 \section{全局路由预测器结构}
 第四章的全局预测器使用第 0 层 Router 概率、Top-$k$ 专家 one-hot、token 位置以及可选的 input id、模态和路由统计特征，一次性预测后续所有 MoE 层的专家激活概率。
@@ -435,13 +443,17 @@ def forward(
 
     torch.cuda.current_stream().wait_stream(self.vision_stream)
 
-    merged_h, m_cos, m_sin, m_cu, m_max = self.visual.excute_semantic_merge(
-        mid_h, inputs_embeds, r_cos, r_sin
+    text_feat = inputs_embeds
+    if kwargs.get("image_input_mask") is not None:
+        text_feat = inputs_embeds[~kwargs["image_input_mask"]]
+
+    merged_h, m_cu, m_cos, m_sin, m_max = self.visual.execute_semantic_merge(
+        mid_h, text_feat, r_cos, r_sin
     )
 
     with torch.cuda.stream(self.vision_stream):
         final_vision_features = self.visual.forward_stage2(
-            merged_h.unsqueeze(1), m_cu, m_cos, m_sin, m_max
+            merged_h, m_cu, m_cos, m_sin, m_max
         )
 
     if self.use_deepstack:
