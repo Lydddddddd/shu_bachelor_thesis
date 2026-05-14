@@ -41,6 +41,8 @@ S_{\mathrm{norm}}(m,D)=\frac{S(m,D)}{S(\mathrm{baseline},D)},
 \begin{table}[!htbp]
 \centering
 \small
+\caption{Visual Encoder 优化前后的任务效果保持性}
+\label{tab:encoder-quality}
 \begin{tabular}{lrrrr}
 \hline
 方法 & 保留比例 & MMBench & MME & 输出一致率 \\
@@ -52,8 +54,6 @@ SAT-ToMe & 63.7\% & 0.997 & 0.995 & 99.1\% \\
 SAT-ToMe + Pipeline & 63.7\% & 0.997 & 0.995 & 99.1\% \\
 \hline
 \end{tabular}
-\caption{Visual Encoder 优化前后的任务效果保持性}
-\label{tab:encoder-quality}
 \end{table}
 
 从表~\ref{tab:encoder-quality} 可以看出，在相同平均保留比例下，随机裁剪会造成明显效果下降，说明视觉 Token 不能被无差别删除；固定比例 ToMe 能够缓解这一问题，但仍会在细粒度理解样本上损失部分有效信息。SAT-ToMe 由于引入文本语义相关性和基于熵的自适应压缩率，归一化任务分数保持在 0.995 以上，输出一致率达到 99.1\%，说明第三章策略在当前实验配置下没有造成明显的模型能力下降。
@@ -73,6 +73,8 @@ SAT-ToMe + Pipeline & 63.7\% & 0.997 & 0.995 & 99.1\% \\
 \begin{table}[!htbp]
 \centering
 \small
+\caption{Visual Encoder 优化的 TTFT 与前端耗时收益}
+\label{tab:encoder-speedup}
 \begin{tabular}{lrrrrr}
 \hline
 方法 & TTFT/ms & Encoder/ms & 占比 & TTFT 加速 & Encoder 加速 \\
@@ -82,8 +84,6 @@ SAT-ToMe & 25738 & 1088 & 4.2\% & 1.62x & 7.88x \\
 SAT-ToMe + Pipeline & 25512 & 800 & 3.1\% & 1.63x & 10.72x \\
 \hline
 \end{tabular}
-\caption{Visual Encoder 优化的 TTFT 与前端耗时收益}
-\label{tab:encoder-speedup}
 \end{table}
 
 表~\ref{tab:encoder-speedup} 进一步量化了加速效果。SAT-ToMe 使整体 TTFT 从 41682ms 降至 25738ms，整体加速比为 1.62x；叠加 Pipeline 后 TTFT 进一步降至 25512ms，整体加速比为 1.63x。虽然 Pipeline 对整体 TTFT 的额外提升不如 Token 合并明显，但其将 Visual Encoder 自身的可见耗时从 1088ms 降至 800ms，使视觉前端相对 baseline 的加速比达到 10.72x。该结果说明，第三章方法的主要收益来自两部分：一是减少后续视觉层处理的 Token 数量，二是通过双流执行隐藏剩余视觉计算的等待时间。
@@ -106,6 +106,8 @@ SAT-ToMe + Pipeline & 25512 & 800 & 3.1\% & 1.63x & 10.72x \\
 \begin{table}[!htbp]
 \centering
 \small
+\caption{真实 CPU-GPU expert offload 微基准的代表性结果}
+\label{tab:real-offload-result}
 \begin{tabular}{llrrrr}
 \hline
 setting & policy & elapsed\_s & speedup & cache\_hits & transfer\_GB \\
@@ -118,8 +120,6 @@ setting & policy & elapsed\_s & speedup & cache\_hits & transfer\_GB \\
 \texttt{cap160} & oracle & 1.571 & 3.16x & 1208 & 16.55 \\
 \hline
 \end{tabular}
-\caption{真实 CPU-GPU expert offload 微基准的代表性结果}
-\label{tab:real-offload-result}
 \end{table}
 
 结果表明，在两种设置下，预测驱动预取都能显著减少真实访问路径上的同步等待。对于 \texttt{cap96}，predictor 将耗时从 4.283s 降至 1.432s，获得 2.99x 加速；对于 \texttt{cap160}，predictor 将耗时从 4.962s 降至 1.864s，获得 2.66x 加速。oracle 代表预测完全正确时的上界，其结果说明当前 predictor 与上界之间仍有提升空间，但已经能够捕获大量有价值的未来专家访问。
