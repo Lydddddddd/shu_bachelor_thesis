@@ -28,7 +28,7 @@ S_{\mathrm{norm}}(m,D)=\frac{S(m,D)}{S(\mathrm{baseline},D)},
 \end{equation}
 其中 $N_{\mathrm{same}}$ 表示经相同答案解析规则处理后与 baseline 答案一致的样本数，$N_{\mathrm{all}}$ 表示参与比较的样本总数。对于选择题样本，比较解析后的选项；对于开放式样本，先进行大小写、空白和标点归一化，再比较核心答案字符串。表中的保留比例表示压缩后视觉 Token 数量与 baseline 视觉 Token 数量之比在测试样本上的平均值。
 
-需要说明的是，工程中也实现了基于 Hugging Face Transformers 的单卡端到端 generate 原型，用于验证完整链路可运行。但该链路会同时叠加图像预处理、Python hook、Transformers generate 调度和专家缓存控制等多个因素，波动较大。因此本文不将单卡端到端 generate 的单次结果作为主实验，而是将主结果集中在更稳定、可解释的真实 expert 搬运微基准上。
+工程中也实现了基于 Hugging Face Transformers 的单卡端到端 generate 原型，用于验证完整链路可运行。但该链路会叠加图像预处理、Python hook、generate 调度和专家缓存控制等因素，波动较大，因此本文将主结果集中在更稳定、可解释的真实 expert 搬运微基准上。
 
 在微基准中，\texttt{demand} 作为基线策略，表示真实访问到来时才同步加载专家；\texttt{predictor} 表示使用训练好的全局预测器提前预取专家；\texttt{oracle} 使用未来真实路由作为上界。GPU expert cache 的容量以“层-专家”切片为单位，因此容量为 128 并不等价于 128 个专家全部常驻显存，而是表示最多缓存 128 个具体的层内 expert 权重切片。
 
@@ -122,9 +122,9 @@ setting & policy & elapsed\_s & speedup & cache\_hits & transfer\_GB \\
 \end{tabular}
 \end{table}
 
-结果表明，在两种设置下，预测驱动预取都能显著减少真实访问路径上的同步等待。对于 \texttt{cap96}，predictor 将耗时从 4.283s 降至 1.432s，获得 2.99x 加速；对于 \texttt{cap160}，predictor 将耗时从 4.962s 降至 1.864s，获得 2.66x 加速。oracle 代表预测完全正确时的上界，其结果说明当前 predictor 与上界之间仍有提升空间，但已经能够捕获大量有价值的未来专家访问。
+结果表明，在两种设置下，预测驱动预取都能显著减少同步等待。对于 \texttt{cap96}，predictor 将耗时从 4.283s 降至 1.432s，获得 2.99x 加速；对于 \texttt{cap160}，predictor 将耗时从 4.962s 降至 1.864s，获得 2.66x 加速。oracle 代表预测完全正确时的上界，说明当前 predictor 仍有提升空间，但已经能够捕获大量有价值的未来专家访问。
 
-同时可以看到，predictor 的传输量通常高于 demand。这是预测式调度的典型特征：它并不是直接减少总传输量，而是在受限预算内用额外的预取搬运换取同步等待下降。只要被提前加载的专家能够在未来命中，整体耗时就会下降；若预测质量不足或缓存压力过大，则可能出现额外搬运抵消收益的问题。
+同时可以看到，predictor 的传输量通常高于 demand。这是预测式调度的典型特征：它并不直接减少总传输量，而是在受限预算内用额外预取换取同步等待下降；若预测质量不足或缓存压力过大，额外搬运也可能抵消收益。
 
 \section{结果讨论}
 综合实验可以得到以下结论。
@@ -138,4 +138,4 @@ setting & policy & elapsed\_s & speedup & cache\_hits & transfer\_GB \\
 最后，专家调度需要谨慎利用预测结果。实验中最有效的不是扩大预取集合，而是压缩候选集合：保留高置信度、近层、margin 足够大的专家，并通过保护当前访问专家和限制每层预取数量避免缓存被低价值专家污染。
 
 \section{本章小结}
-本章对第三章的 Visual Encoder 优化和第四章的专家提前调度进行了实验评估。视觉侧实验表明，SAT-ToMe 在保持任务效果基本稳定的同时，将 Visual Encoder 可见耗时降至 baseline 的 9.3\% 左右，并使整体 TTFT 获得约 1.63x 加速。专家侧实验表明，全局预测器能够达到 0.72 左右的 mean recall；在真实搬运场景下，predictor 与 oracle 都能显著降低同步等待并带来加速；缓存容量决定了预测收益能否落地。
+本章对 Visual Encoder 优化和专家提前调度进行了实验评估。结果表明，SAT-ToMe 在保持任务效果稳定的同时，将 Visual Encoder 可见耗时降至 baseline 的 9.3\% 左右，并使整体 TTFT 获得约 1.63x 加速；专家侧全局预测器达到约 0.72 mean recall，在真实搬运场景下 predictor 与 oracle 都能显著降低同步等待，缓存容量则决定预测收益能否落地。
