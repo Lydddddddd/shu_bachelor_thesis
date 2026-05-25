@@ -3,11 +3,11 @@
 \label{cha:intro}
 
 \section{VL-MoE 推理优化的研究背景和意义}
-近年来，多模态大模型（Multimodal Large Models, MLLMs）快速发展，图像、文本、语音等多种模态的统一建模逐渐成为大模型研究的重要方向。
-以 Qwen-VL、Qwen2-VL、MiniCPM-V 和 DeepSeek-VL2 为代表的开源多模态模型在视觉问答、文档理解、图文检索和复杂推理等任务上展现出较强能力\cite{bai2023qwenvl,wang2024qwen2vl,yao2024minicpmv,wu2024deepseekvl2}。
+近年来，多模态大模型（Multimodal Large Models, MLLMs）快速发展。Transformer 架构为大规模序列建模提供了基础\cite{vaswani2017attention}，Vision Transformer 将图像划分为 Patch Token 后进行全局建模\cite{dosovitskiy2021vit}，CLIP 等图文预训练方法进一步推动了视觉与语言表示对齐\cite{radford2021clip}，使图像、文本、语音等多种模态的统一建模逐渐成为大模型研究的重要方向。
+以 BLIP-2、InstructBLIP、LLaVA、Qwen-VL、Qwen2-VL、MiniCPM-V 和 DeepSeek-VL2 为代表的多模态模型在视觉问答、文档理解、图文检索和复杂推理等任务上展现出较强能力\cite{li2023blip2,dai2023instructblip,liu2023llava,bai2023qwenvl,wang2024qwen2vl,yao2024minicpmv,wu2024deepseekvl2}。
 随着模型规模和输入复杂度不断提升，多模态推理系统已经从“能否部署”逐步转向“如何高效部署”的阶段。相比纯文本大模型，多模态模型在推理时不仅要处理文本序列，还需要完成视觉特征提取、跨模态对齐以及自回归生成等多个环节，因此其时延、吞吐和显存开销问题更加突出。
 
-混合专家模型（Mixture of Experts, MoE）通过稀疏激活机制在保持总参数规模较大的同时降低单个 Token 的有效计算量，已成为提升模型参数效率的重要技术路线。
+混合专家模型（Mixture of Experts, MoE）通过稀疏激活机制在保持总参数规模较大的同时降低单个 Token 的有效计算量，已成为提升模型参数效率的重要技术路线\cite{shazeer2017moe,lepikhin2021gshard,fedus2022switch,du2022glam}。
 将 MoE 结构引入视觉语言模型后，形成了 VL-MoE（Vision-Language Mixture-of-Experts）这一具有代表性的多模态稀疏架构\cite{lin2024moellava}。
 如图~\ref{fig:vlmoe-architecture} 所示，VL-MoE 的典型推理流程包括视觉编码、模态融合、路由决策、专家计算与文本解码等阶段。
 在这一过程中，视觉侧和专家侧共同决定了系统性能上限：一方面，图像通常会被划分为大量视觉 Token，导致 Visual Encoder 前端计算负担较重；另一方面，MoE Router 需要为不同 Token 动态选择专家，进而带来权重访问、缓存命中、通信调度以及负载均衡等一系列系统问题。
@@ -63,16 +63,18 @@ Qwen2-VL 进一步提升了模型对动态分辨率、多尺度输入和复杂�
 因此，围绕 VL-MoE 推理过程开展面向负载均衡与系统加速的研究，具有明显的必要性和提升空间。
 
 \subsection{国外 VL-MoE 相关研究概况}
-国外研究在视觉侧优化方面展开较早。Token Merging（ToMe）通过特征相似性对 Vision Transformer 中的 Token 进行动态合并，在尽量保持模型精度的前提下显著降低视觉编码计算量\cite{bolya2023tome}。
+国外研究在视觉侧优化方面展开较早。DynamicViT 和 EViT 等工作从动态 Token 稀疏化与 Token 重组角度减少视觉 Transformer 中的冗余计算\cite{rao2021dynamicvit,liang2022evit}。
+Token Merging（ToMe）通过特征相似性对 Vision Transformer 中的 Token 进行动态合并，在尽量保持模型精度的前提下显著降低视觉编码计算量\cite{bolya2023tome}。
 PuMer 则进一步将视觉与文本语义信息结合起来，对视觉语言模型中的 Token 同时进行裁剪和合并，验证了语义感知压缩对多模态推理加速的有效性\cite{cao2023pumer}。
 这类工作表明，视觉侧冗余是多模态推理优化的重要突破口。
 
-在通用推理系统方面，vLLM 通过 PagedAttention 机制显著改善了 KV Cache 的内存管理效率，为大模型推理提供了高吞吐基础设施\cite{kwon2023pagedattention}。
+在通用推理系统方面，Orca 针对 Transformer 生成模型提出了连续批处理式服务系统\cite{yu2022orca}，FlashAttention 通过 IO 感知的精确注意力计算降低了注意力算子的访存开销\cite{dao2022flashattention}，vLLM 通过 PagedAttention 机制显著改善了 KV Cache 的内存管理效率，为大模型推理提供了高吞吐基础设施\cite{kwon2023pagedattention}。
 DistServe 从服务系统角度将 Prefill 与 Decoding 解耦部署，以提升在线场景中的整体 goodput\cite{zhong2024distserve}。
+FlexGen 则展示了利用异构内存和 offload 策略提升单 GPU 大模型推理吞吐的可行性\cite{sheng2023flexgen}。
 上述研究对大模型推理系统具有重要意义，但其优化重点主要面向稠密模型或通用服务流程，对于 VL-MoE 特有的视觉编码链路、多模态负载差异以及专家路由异质性考虑不足。
 
 在 MoE 推理专项优化方面，MoE-LLaVA 首次较系统地将 MoE 结构应用于大型视觉语言模型，为后续 VL-MoE 研究提供了代表性架构范式\cite{lin2024moellava}。
-MoE-Infinity 从激活感知卸载角度降低了专家权重搬移开销\cite{xue2024moeinfinity}，Klotski 利用专家感知的多 Batch 流水机制提升了 MoE 推理效率\cite{fang2025klotski}。
+DeepSpeed-MoE 从训练和推理系统角度讨论了大规模 MoE 的高效支撑机制\cite{rajbhandari2022deepspeedmoe}，MoE-Infinity 从激活感知卸载角度降低了专家权重搬移开销\cite{xue2024moeinfinity}，Klotski 利用专家感知的多 Batch 流水机制提升了 MoE 推理效率\cite{fang2025klotski}。
 进一步地，ExpertFlow 将预测式路由路径、专家缓存与动态 Token 调度结合起来，展示了“基于可预测性进行提前调度”的潜力\cite{he2024expertflow}。
 然而，现有研究大多仍然面向纯文本 MoE 或通用稀疏模型展开，对 VL-MoE 场景下图像 Token 与文本 Token 的异质性利用不足，也较少从“视觉侧高开销 + 专家侧高动态性”两个问题共同出发进行端到端联合优化。
 

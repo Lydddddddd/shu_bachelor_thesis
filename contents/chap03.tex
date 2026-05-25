@@ -9,14 +9,6 @@
 
 基于上述考虑，本文提出一种面向 VL-MoE 的多模态感知视觉优化方法，其核心思想可以概括为“语义引导的自适应 Token 压缩 + 面向实时推理的异步流水执行”。
 其中，前者利用文本查询对视觉 Token 进行语义打分与自适应筛选，在输入进入 MoE 主干网络之前尽可能去除低信息密度区域；后者将视觉编码过程拆分为两个阶段，并利用独立 CUDA 流与文本侧处理并发执行，从而减少前端阻塞时间。
-整体框架如图~\ref{fig:sat-tome-framework} 所示。
-
-\begin{figure}[!htbp]
-\centering
-\includegraphics[width=\textwidth]{sat_tome_framework.png}
-\caption{基于文本引导的自适应视觉 Token 压缩框架}
-\label{fig:sat-tome-framework}
-\end{figure}
 
 为了便于后续描述，设输入图像经过 Patch Embedding 和若干视觉层编码后得到视觉 Token 序列
 \begin{equation}
@@ -53,6 +45,14 @@ X_{\mathrm{red}} \in \mathbb{R}^{K \times d_v}, \qquad K < N,
 \end{figure}
 
 针对这一问题，本文引入文本引导的语义打分机制。基本思想是：将文本查询映射到视觉特征空间中，测量每个视觉 Token 与文本语义的相关性，再依据语义分布的集中程度自适应确定保留 Token 数量。这样既能够优先保留与当前问题强相关的局部区域，又能够根据不同样本的语义复杂度动态调整压缩力度。
+本节提出的自适应视觉 Token 压缩流程如图~\ref{fig:sat-tome-framework} 所示。
+
+\begin{figure}[!htbp]
+\centering
+\includegraphics[width=\textwidth]{sat_tome_framework.png}
+\caption{基于文本引导的自适应视觉 Token 压缩框架}
+\label{fig:sat-tome-framework}
+\end{figure}
 
 \subsection{文本引导的语义相关性建模}
 为了在视觉空间中刻画“当前问题与图像局部内容的匹配程度”，本文首先将文本全局特征投影到视觉维度，得到文本查询向量
@@ -198,7 +198,7 @@ H_{\mathrm{final}} = \left[ H_{\mathrm{stage2}} \,\|\, F_{\mathrm{deep1}} \,\|\,
 
 此外，在工程实现中还需要处理以下问题：
 \begin{enumerate}
-\item 变长序列重建：视觉 Token 压缩后，每个样本的有效长度可能不同，因此需要重新构建 `cu\_seqlens` 和 `max\_seqlen`，以适配后续高效注意力算子；
+\item 变长序列重建：视觉 Token 压缩后，每个样本的有效长度可能不同，因此需要重新构建 \texttt{cu\_seqlens} 和 \texttt{max\_seqlen}，以适配后续高效注意力算子；
 \item 缓冲区复用：为减少额外显存碎片，Stage 1 输出、中间保留索引和 Stage 2 输入缓冲区应尽量复用；
 \item 与主干接口兼容：压缩后的视觉表示维度需与后续模态融合模块保持兼容，避免额外的投影或数据搬移开销。
 \end{enumerate}
