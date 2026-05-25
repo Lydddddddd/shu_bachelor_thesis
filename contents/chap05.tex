@@ -34,6 +34,9 @@ S_{\mathrm{norm}}(m,D)=\frac{S(m,D)}{S(\mathrm{baseline},D)},
 
 实验统计的主要指标包括：总耗时 \texttt{elapsed\_s}、相对 \texttt{demand} 的加速比、同步加载次数、预取加载次数、缓存命中次数、传输数据量以及 expert-token pair 吞吐。
 
+为了保证实验结论与第三章、第四章的方法目标对应，本文将结果解释分为两条线索。第一条线索是视觉侧优化是否在不明显损害任务效果的前提下降低 TTFT，重点观察归一化任务分数、输出一致率、Encoder 可见耗时和整体 TTFT。第二条线索是专家侧预测是否真正减少同步等待，重点观察 predictor 相对 demand 的总耗时变化，以及 predictor 与 oracle 上界之间的差距。前者回答“压缩是否安全”，后者回答“预测是否有用”。
+
+
 \section{Visual Encoder 优化实验}
 \subsection{任务效果保持性}
 第三章方法首先需要满足“压缩不明显损害模型效果”的约束。为此，本文在 MMBench\cite{liu2024mmbench} 与 MME\cite{fu2023mme} 子集上比较未压缩 baseline、随机裁剪、固定比例 Token 合并、SAT-ToMe 语义自适应合并以及 SAT-ToMe 加异步流水五种配置。为避免不同评测集原始分值尺度不同，表~\ref{tab:encoder-quality} 采用归一化任务分数表示，其中 baseline 记为 1.000，数值越接近 1.000 表示模型效果越接近原始模型。
@@ -57,6 +60,8 @@ SAT-ToMe + Pipeline & 63.7\% & 0.997 & 0.995 & 99.1\% \\
 \end{table}
 
 从表~\ref{tab:encoder-quality} 可以看出，在相同平均保留比例下，随机裁剪会造成明显效果下降，说明视觉 Token 不能被无差别删除；固定比例 ToMe 能够缓解这一问题，但仍会在细粒度理解样本上损失部分有效信息。SAT-ToMe 由于引入文本语义相关性和基于熵的自适应压缩率，归一化任务分数保持在 0.995 以上，输出一致率达到 99.1\%，说明第三章策略在当前实验配置下没有造成明显的模型能力下降。
+
+进一步分析可以看到，随机裁剪和 SAT-ToMe 的差异并不只来自保留数量，而来自保留对象。随机裁剪在平均保留比例相同的情况下仍然删除了大量任务相关区域，导致 MMBench 和 MME 均出现明显下降；Static ToMe 通过特征相似性合并冗余 Token，效果好于随机裁剪，但由于缺少文本问题引导，在需要关注局部证据的样本上仍可能保留不充分。SAT-ToMe 则通过文本语义打分优先保留与问题相关的视觉区域，因此在相同保留比例下取得更高输出一致率。
 
 需要强调的是，异步流水本身不改变模型计算图中的语义操作，只改变视觉侧和文本侧计算的执行顺序；系统在 Stage 1 后和 Stage 2 后通过 \texttt{wait\_stream} 保证依赖同步。因此，SAT-ToMe + Pipeline 与 SAT-ToMe 的任务效果保持一致，差异主要体现在执行时间上。
 
@@ -88,10 +93,16 @@ SAT-ToMe + Pipeline & 25512 & 800 & 3.1\% & 1.63x & 10.72x \\
 
 表~\ref{tab:encoder-speedup} 进一步量化了加速效果。SAT-ToMe 使整体 TTFT 从 41682ms 降至 25738ms，整体加速比为 1.62x；叠加 Pipeline 后 TTFT 进一步降至 25512ms，整体加速比为 1.63x。虽然 Pipeline 对整体 TTFT 的额外提升不如 Token 合并明显，但其将 Visual Encoder 自身的可见耗时从 1088ms 降至 800ms，使视觉前端相对 baseline 的加速比达到 10.72x。该结果说明，第三章方法的主要收益来自两部分：一是减少后续视觉层处理的 Token 数量，二是通过双流执行隐藏剩余视觉计算的等待时间。
 
+从占比变化看，Visual Encoder 在 baseline 中占 TTFT 的 20.6\%，加入 SAT-ToMe + Pipeline 后下降到 3.1\%。这说明视觉前端已经不再是当前配置下的主要可见瓶颈，后续继续优化 TTFT 时，需要更多关注 Prefill、MoE 专家调度和解码前准备等部分。换言之，第三章方法完成了对前端视觉瓶颈的有效削减，但整体 TTFT 的进一步下降仍依赖第四章专家侧调度和更完整的推理系统优化。
+
+
 \section{全局预测器离线结果}
 全局预测器训练使用 fresh 数据集，总计 8347 个 token，其中训练集 7268 个、验证集 1079 个。训练过程中，mean recall 从初始的 0.18 左右逐步上升，最终 best mean recall 达到 0.7219。early/mid/late 三个区间的 recall 分别为 0.7158、0.7453 和 0.7042，训练曲线与分视野结果见第四章图~\ref{fig:fig4-train-curve} 和表~\ref{tab:global-recall}。
 
 这说明 layer-0 条件化输入已经能够为后续层专家访问提供有效约束。换句话说，预测器并不是在盲猜未来专家，而是在利用首层 router 概率、Top-$k$ 集合、token 位置、输入 id 和模态信息做条件化推断。
+
+从分视野结果看，mid 区间 recall 略高于 early 和 late。early 区间距离当前层更近，但某些 token 在前几层仍处于模态融合和语义调整阶段，路由可能存在快速变化；late 区间距离较远，相关性逐渐衰减；mid 区间在当前数据上取得更高 recall，说明 layer-0 信号对中间层专家路径具有较强约束。该现象也支持第四章中采用层距衰减的调度策略，即越远的预测越需要谨慎使用。
+
 
 \section{真实 CPU-GPU expert offload 微基准}
 本节在真实 CPU-GPU expert offload 微基准中检验全局预测器能否转化为实际搬运收益。实验选取两个代表性缓存容量设置，比较 demand 基线、本文 predictor 方法和 oracle 上界。其中 \texttt{cap96} 表示 GPU cache 容量为 96、采样 12 个 trace group、每组最多 64 个 token；\texttt{cap160} 表示 GPU cache 容量为 160、采样 20 个 trace group、每组最多 64 个 token。两组设置用于观察不同缓存容量和不同 trace 规模下的调度收益，因此二者的绝对耗时不直接互相比较。三种策略的整体对比如图~\ref{fig:fig5-real-compare} 所示，具体数值见表~\ref{tab:real-offload-result}。
@@ -126,6 +137,10 @@ setting & policy & elapsed\_s & speedup & cache\_hits & transfer\_GB \\
 
 同时可以看到，predictor 的传输量通常高于 demand。这是预测式调度的典型特征：它并不直接减少总传输量，而是在受限预算内用额外预取换取同步等待下降；若预测质量不足或缓存压力过大，额外搬运也可能抵消收益。
 
+对比 predictor 与 oracle 可以进一步判断当前方法的改进空间。在 \texttt{cap96} 中，predictor 的耗时为 1.432s，已经接近 oracle 的 1.354s，说明在较小 trace 规模和较紧缓存下，当前预测器能够覆盖大部分高价值专家；在 \texttt{cap160} 中，predictor 与 oracle 的差距扩大到 1.864s 对 1.571s，说明当 trace 规模和缓存容量增加后，预测质量、候选排序和预取预算之间仍有优化空间。
+
+总体而言，真实 offload 微基准验证了第四章方法的关键假设：VL-MoE 的专家路由具有可预测性，而且预测信号能够在受限缓存中带来同步等待下降。虽然 predictor 尚未达到 oracle 上界，但已经显著优于 demand 策略，说明专家提前调度是资源受限 VL-MoE 部署中的有效优化方向。
+
 \section{结果讨论}
 综合实验可以得到以下结论。
 
@@ -136,6 +151,8 @@ setting & policy & elapsed\_s & speedup & cache\_hits & transfer\_GB \\
 再次，预测收益依赖于缓存约束与预测质量的匹配。GPU expert cache 决定系统能够同时保留多少层-专家切片；当缓存过紧时，额外预取仍可能挤占当前工作集。真正有价值的是在有限显存下，把资源留给最可能在近未来被访问的专家。
 
 最后，专家调度需要谨慎利用预测结果。实验中最有效的不是扩大预取集合，而是压缩候选集合：保留高置信度、近层、margin 足够大的专家，并通过保护当前访问专家和限制每层预取数量避免缓存被低价值专家污染。
+
+上述结果也揭示了当前系统的两个边界。第一，视觉侧和专家侧优化分别带来了明确收益，但尚未在稳定的在线 serving 框架中形成完全闭环的端到端评估。由于完整链路会叠加 batching、KV cache、图像预处理、Python hook 和 expert cache 控制等因素，直接端到端数字更容易受环境波动影响。第二，当前预测器训练数据规模仍较小，主要覆盖固定模型和公开评测子集。若迁移到更长上下文、更复杂图文组合或不同 VL-MoE 架构，预测器可能需要重新采集 trace 并调整特征。
 
 \section{本章小结}
 本章对 Visual Encoder 优化和专家提前调度进行了实验评估。结果表明，SAT-ToMe 在保持任务效果稳定的同时，将 Visual Encoder 可见耗时降至 baseline 的 9.3\% 左右，并使整体 TTFT 获得约 1.63x 加速；专家侧全局预测器达到约 0.72 mean recall，在真实搬运场景下 predictor 与 oracle 都能显著降低同步等待，缓存容量则决定预测收益能否落地。

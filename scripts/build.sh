@@ -23,7 +23,7 @@ full_compile() {
     local filename=$1
     mkdir -p build/$CONTENT_DIR
     xelatex -synctex=1 -interaction=nonstopmode -file-line-error -output-directory=build "$filename" || exit 1
-    bibtex "build/$filename" || exit 1
+    (cd build && BIBINPUTS=..//: BSTINPUTS=..//: bibtex "$filename") || exit 1
     xelatex -synctex=1 -interaction=nonstopmode -file-line-error -output-directory=build "$filename" || exit 1
     xelatex -synctex=1 -interaction=nonstopmode -file-line-error -output-directory=build "$filename" || exit 1
     echo "Full compilation sequence completed successfully!"
